@@ -169,6 +169,9 @@ void Inkling::load_geometry() {
     w_scale_ = scale ? (float) scale->num() : 0.f;
     reserve_mmq_ = true;   // MMQ's scratch before the expert cache takes the VRAM
     lowbit_experts_ = true;   // Unsloth's files: IQ1_S gate_up and Q2_0 down experts
+#if !defined(STRATA_USE_HIP)
+    lane_slots_ = true;       // the cached experts' launches through MmvqSlots::lanes' kernels (measured on CUDA)
+#endif
     situ_ = Situ{shape_f("activation.situ_beta"), shape_f("activation.situ_linear_beta")};
     need(situ_->beta > 0.f, "bad activation.situ_beta");
     const MetaValue* real = find("vocab_size_unpadded");

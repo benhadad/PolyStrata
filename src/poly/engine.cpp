@@ -4223,6 +4223,7 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
             for (int i0 = 0; i0 < n_cached; i0 += per) {
                 const int m = std::min(per, n_cached - i0);
                 kernels::MmvqSlots gate_up{}, up{}, down{};
+                gate_up.lanes = up.lanes = down.lanes = lane_slots_;
                 for (int j = 0; j < m; ++j) {
                     const Cached& c = cached[i0 + j];
                     gate_up.w[j] = c.slot;
@@ -4237,12 +4238,15 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
                 }
                 // a mixed layer's gate and up are each a matrix of n_ff rows of its own type, up's into the second half
                 const int gu_rows = L.mixed() ? n_ff_exp_ : 2 * n_ff_exp_;
-                const bool one = m > 1 && kernels::native_mmvq_slots((int) L.gu_type, gate_up, m, n_embd_, gu_rows, st_);
+                // one matrix too where its launch is a warp a row (MmvqSlots::lanes): the same bits, and faster where
+                // the format has a lanes kernel (measured for Inkling 2's on CUDA)
+                const bool slots = m > 1 || lane_slots_;
+                const bool one = slots && kernels::native_mmvq_slots((int) L.gu_type, gate_up, m, n_embd_, gu_rows, st_);
                 for (int j = 0; j < m && !one; ++j)
                     kernels::native_mmvq((int) L.gu_type, gate_up.w[j], gate_up.x[j], gate_up.y[j], n_embd_, gu_rows, 1,
                                          st_);
                 if (L.mixed()) {
-                    const bool one_u = m > 1 && kernels::native_mmvq_slots((int) L.u_type, up, m, n_embd_, n_ff_exp_, st_);
+                    const bool one_u = slots && kernels::native_mmvq_slots((int) L.u_type, up, m, n_embd_, n_ff_exp_, st_);
                     for (int j = 0; j < m && !one_u; ++j)
                         kernels::native_mmvq((int) L.u_type, up.w[j], up.x[j], up.y[j], n_embd_, n_ff_exp_, 1, st_);
                 }
@@ -4250,7 +4254,7 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
                 for (int j = 0; j < m && (es.gate || es.up); ++j) es.e[j] = cached[i0 + j].e;
                 act_rows(g_, h_, m, limit, &es);
                 kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
-                if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, n_embd_, st_)))
+                if (!(slots && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, n_embd_, st_)))
                     for (int j = 0; j < m; ++j)
                         kernels::native_mmvq((int) L.d_type, down.w[j], down.x[j], down.y[j], n_ff_exp_, n_embd_, 1,
                                              st_);
@@ -4368,10 +4372,10 @@ bool Engine::moe_card(Layer& L, int il, int n) {
     const void* const* table = d_slots_ + (size_t) il * n_expert_;
     const size_t xq_row = kernels::native_q8_1_bytes(n_embd_), ff = (size_t) n_ff_exp_;
     // a mixed layer's gate and up are each a matrix of n_ff rows of its own type, up's into the second half
-    const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, xq_row, n_used_, g_, 2 * ff};
+    const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, xq_row, n_used_, g_, 2 * ff, lane_slots_};
     kernels::native_mmvq_ids((int) L.gu_type, gate_up, rr, n_embd_, L.mixed() ? n_ff_exp_ : 2 * n_ff_exp_, st_);
     if (L.mixed()) {
-        const kernels::MmvqIds up{table, d_ids_, L.gu_bytes, xq_, xq_row, n_used_, g_ + ff, 2 * ff};
+        const kernels::MmvqIds up{table, d_ids_, L.gu_bytes, xq_, xq_row, n_used_, g_ + ff, 2 * ff, lane_slots_};
         kernels::native_mmvq_ids((int) L.u_type, up, rr, n_embd_, n_ff_exp_, st_);
     }
     const ExpertScales es = expert_scales(L, d_ids_);
@@ -4379,7 +4383,7 @@ bool Engine::moe_card(Layer& L, int il, int n) {
     if (!L.h_s_down.empty()) expert_weights(d_wts_, fp(L.s_down), d_ids_, rr, st_);
     kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);   // the rows back to back, as one vector
     const kernels::MmvqIds down{table, d_ids_, L.gu2(), q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_,
-                                (size_t) n_embd_};
+                                (size_t) n_embd_, lane_slots_};
     kernels::native_mmvq_ids((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
     moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
     return true;
