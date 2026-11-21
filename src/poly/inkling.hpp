@@ -40,6 +40,10 @@ protected:
     void alloc_caches() override;
     void assign_scratch() override;
     bool sees() const override { return true; }   // pictures (strata-vision's rows) in place of tokens
+    /// step()'s rows in one head: the products, mixes and controllers for all of them, and each row's caches,
+    /// convolution states and position from its own sequence (attn(), post_conv()).  The rows' positions go to the
+    /// kernels by value, so a step is not recorded: Inkling sets no Layer::fixed, and step() records only those.
+    bool batch_heads() const override { return true; }
     int widest() const override { return std::max(n_head_ * head_dim_, 2 * n_embd_); }
     int streams() const override { return kStreams; }
     void layer_head(Layer& L, int il, int n) override;
@@ -102,6 +106,8 @@ private:
     void scatter(int k, const float* src, int n);
     void copy_stream(int from, int to, int n);
     void attn(Block& B, int il, const float* xq, const float* xk, const float* xv, const void* const* q8, int n);
+    int64_t attn_room(const Block& B, int n) const;
+    void post_conv(const float* x, float* state, const Dev& w, float* acc, int n, bool fresh, const Row* rows);
     void dump(const char* name, int il, const float* dev, int width, int n);
     int slot_of(int v) const;   ///< llama.cpp's layer index of visit v (its cache slot), for the dumps
     template <class F>
@@ -124,6 +130,7 @@ private:
     // device scratch, rows_ tokens each
     float *res_ = nullptr;                 ///< the stream (kCur) from a layer's head to its tail
     float* cres_ = nullptr;                ///< where the call's stream is worked on: res_, or r_ itself for one token
+    const Row* tail_rows_ = nullptr;       ///< step()'s rows (rows_of_) from a layer's head to its tail
     float *blk_[4] = {};                   ///< the blocks, gathered from r_
     float *bank_ = nullptr, *bank_out_ = nullptr;
     float *msg_[4] = {};                   ///< a core layer's messages: q, k, v, ffn

@@ -47,6 +47,34 @@ const Names kMetaNames[] = {
     {"loop.count", {"num_loops", nullptr}},
 };
 
+// Where a visit's keys and values go, in its planes pl: fp16 keys and values, or q8_0 codes and scales.
+InklingKvDst kv_dst(bool q8, uint8_t* const* pl, int ring) {
+    InklingKvDst dst;
+    if (q8) {
+        dst.kc = (int8_t*) pl[0], dst.ks = (uint16_t*) pl[1];
+        dst.vc = (int8_t*) pl[2], dst.vs = (uint16_t*) pl[3];
+    } else {
+        dst.k = (uint16_t*) pl[0], dst.v = (uint16_t*) pl[1];
+    }
+    dst.ring = ring;
+    return dst;
+}
+
+// The caches the attention of a token at `pos` reads, in the planes pl.
+InklingAttnSeq attn_seq(bool q8, uint8_t* const* pl, int64_t pos, int64_t room) {
+    InklingAttnSeq c;
+    if (q8) {
+        c.kq8 = Kvq8{(const int8_t*) pl[0], (const uint16_t*) pl[1]};
+        c.vq8 = Kvq8{(const int8_t*) pl[2], (const uint16_t*) pl[3]};
+    } else {
+        c.kcache = (const uint16_t*) pl[0];
+        c.vcache = (const uint16_t*) pl[1];
+    }
+    c.pos = pos;
+    c.room = room;
+    return c;
+}
+
 }  // namespace
 
 // ---- visits ----------------------------------------------------------------------------------------------------
@@ -151,10 +179,12 @@ void Inkling::load_geometry() {
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);
     clamp_shexp_ = clamp_exp_;
 
-    // Not supported yet: guessed windows (the convolutions' snapshots), several sequences and a split over cards.
+    // Not supported yet: guessed windows (the convolutions' snapshots) and a split over cards.
     if (opt_.window > 1) throw std::runtime_error("Inkling 2: --window is not supported yet (a window is 1 token)");
     if (!opt_.draft_model.empty()) throw std::runtime_error("Inkling 2: --draft-model is not supported yet");
-    if (opt_.batch > 0) throw std::runtime_error("Inkling 2: --batch is not supported yet");
+    // step()'s rows are a sequence's each, and the _seqs kernels take kInklingSeqRows of them a launch
+    if (opt_.batch + 1 > kInklingSeqRows)
+        throw std::runtime_error("Inkling 2: --batch takes at most " + std::to_string(kInklingSeqRows - 1));
     if (opt_.kv_format != KvFmt::kFp16 && opt_.kv_format != KvFmt::kQ8_0)
         throw std::runtime_error("Inkling 2: the attention cache is fp16 or q8_0");
     if (!opt_.layer_split.empty()) throw std::runtime_error("Inkling 2: --layer-split is not supported yet");
@@ -371,6 +401,29 @@ void Inkling::dump(const char* name, int v, const float* dev, int width, int n) 
 
 // ---- a layer ---------------------------------------------------------------------------------------------------
 
+// The rows the attention of n tokens from pos_ is sized for: a full visit's in room()'s steps rather than pos + n,
+// so that its splits, and so a token's bits, do not change with every position.  A window visit's serves every
+// position: sized for the context, it gets the window's splits and the one more a window not starting on a split's
+// edge spans (window + n - 1 rows would leave that one out).
+int64_t Inkling::attn_room(const Block& B, int n) const {
+    return B.swa ? (int64_t) opt_.max_context : Engine::room(n);
+}
+
+// A post-convolution of n rows into acc (written when `fresh`, else added), its state at `state` in the bound
+// sequence's state_, or with step()'s rows at the same place in each row's own sequence's.
+void Inkling::post_conv(const float* x, float* state, const Dev& w, float* acc, int n, bool fresh, const Row* rows) {
+    if (rows) {
+        float* states[kInklingSeqRows];
+        for (int i = 0; i < n; ++i) states[i] = seq_state(rows[i].seq, state);
+        if (fresh) inkling_conv_seqs(x, states, fp(w), acc, n_embd_, n, st_);
+        else inkling_conv_acc_seqs(x, states, fp(w), acc, n_embd_, n, st_);
+    } else if (fresh) {
+        inkling_conv(x, state, fp(w), nullptr, 0, acc, n_embd_, n, st_);
+    } else {
+        inkling_conv_acc(x, state, fp(w), nullptr, 0, acc, n_embd_, n, st_);
+    }
+}
+
 // The attention from its three normed inputs (and their Q8_1 copies) to ao_, through the output's convolution.
 void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const float* xv, const void* const* xq8, int n) {
     const int hk = n_kv_ * head_dim_, hq = n_head_ * head_dim_;
@@ -384,45 +437,55 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
         lin(B.k_conv_proj, xk, ktap_, n, xq8[1]);
         lin(B.v_conv_proj, xv, vtap_, n, xq8[2]);
     }
-    float* const k_state = B.conv;
-    float* const v_state = B.conv + (size_t) (n_conv_ - 1) * hk;
+    const size_t v_at = (size_t) (n_conv_ - 1) * hk;   // the V convolution's state, after K's
     const InklingTau tau = B.swa ? InklingTau{} : InklingTau{tau_alpha_, tau_floor_};
-    // K and V from their projections into the cache in one launch, Q's and R's clips in another
-    InklingKvDst dst;
-    if (q8()) {
-        dst.kc = (int8_t*) B.plane[0], dst.ks = (uint16_t*) B.plane[1];
-        dst.vc = (int8_t*) B.plane[2], dst.vs = (uint16_t*) B.plane[3];
-    } else {
-        dst.k = (uint16_t*) B.plane[0], dst.v = (uint16_t*) B.plane[1];
-    }
-    dst.ring = B.swa ? ring_ : 0;
-    inkling_kv_store(kraw_, vraw_, k_state, v_state, fp(B.k_conv), fp(B.v_conv), B.swa ? nullptr : ktap_,
-                     B.swa ? nullptr : vtap_, n_kv_, head_dim_, n, qk_clip_, rms_eps_, dst, pos_, k_, v_, st_);
     InklingClipJob jobs[2];
     jobs[0] = {q_, 0, fp(B.q_clip), q_, head_dim_, n_head_, qk_clip_, tau};
     jobs[1] = {rel_, 0, fp(B.rel_clip), rel_, n_rel_, n_head_, rel_clip_, tau};
-    inkling_clip_many(jobs, 2, n, pos_, st_);
-    dump("Qcur", v, q_, hq, n);
-    dump("Kcur", v, k_, hk, n);
-    dump("Vcur", v, v_, hk, n);
-    dump("Rcur", v, rel_, n_head_ * n_rel_, n);
     InklingRel rel;
     rel.r = rel_;
     rel.table = fp(B.rel_bias);
     rel.n_rel = n_rel_;
     rel.extent = B.extent;
-    // The rows the launch is sized for: a full visit's in room()'s steps rather than pos + n, so that its splits, and
-    // so a token's bits, do not change with every position.  A window visit's serves every position: sized for the
-    // context, it gets the window's splits and the one more a window not starting on a split's edge spans (window +
-    // n - 1 rows would leave that one out).
-    const int64_t room = B.swa ? (int64_t) opt_.max_context : Engine::room(n);
-    const Kvq8 kq = q8() ? Kvq8{(const int8_t*) B.plane[0], (const uint16_t*) B.plane[1]} : Kvq8{};
-    const Kvq8 vq = q8() ? Kvq8{(const int8_t*) B.plane[2], (const uint16_t*) B.plane[3]} : Kvq8{};
-    const uint16_t* keys = q8() ? nullptr : (const uint16_t*) B.plane[0];
-    const uint16_t* vals = q8() ? nullptr : (const uint16_t*) B.plane[1];
-    inkling_attend(q_, keys, vals, kq, vq, rel, sink_, pos_, n, att_, head_dim_, n_head_, n_kv_,
-                   1.f / std::sqrt((float) head_dim_), B.swa ? window_ : 0, B.swa ? ring_ : 0, awork_, awork_n_, st_,
-                   room);
+    const float scale = 1.f / std::sqrt((float) head_dim_);
+    const int window = B.swa ? window_ : 0, ring = B.swa ? ring_ : 0;
+    // K and V from their projections into the cache in one launch, Q's and R's clips in another, then the attention
+    if (rows_of_) {   // step(): each row a token of its own sequence, with its caches, convolution state and position
+        InklingKvSeq kv[kInklingSeqRows];
+        InklingAttnSeq at[kInklingSeqRows];
+        int64_t pos[kInklingSeqRows];
+        for (int i = 0; i < n; ++i) {
+            const Row& r = rows_of_[i];
+            uint8_t* pl[4] = {};
+            for (int j = 0; j < planes(); ++j) pl[j] = (uint8_t*) seq_buf(r.seq, B.plane[j]);
+            float* const conv = seq_state(r.seq, B.conv);
+            kv[i].dst = kv_dst(q8(), pl, ring);
+            kv[i].k_state = conv;
+            kv[i].v_state = conv + v_at;
+            kv[i].pos = pos[i] = r.pos;
+            const int64_t keep = pos_;   // its room as alone (room() reads pos_)
+            pos_ = r.pos;
+            at[i] = attn_seq(q8(), pl, r.pos, attn_room(B, 1));
+            pos_ = keep;
+        }
+        inkling_kv_store_seqs(kraw_, vraw_, kv, fp(B.k_conv), fp(B.v_conv), B.swa ? nullptr : ktap_,
+                              B.swa ? nullptr : vtap_, n_kv_, head_dim_, n, qk_clip_, rms_eps_, k_, v_, st_);
+        inkling_clip_many_seqs(jobs, 2, n, pos, st_);
+        inkling_attend_seqs(q_, at, n, rel, sink_, att_, head_dim_, n_head_, n_kv_, scale, window, ring, awork_,
+                            awork_n_, st_);
+    } else {
+        inkling_kv_store(kraw_, vraw_, B.conv, B.conv + v_at, fp(B.k_conv), fp(B.v_conv), B.swa ? nullptr : ktap_,
+                         B.swa ? nullptr : vtap_, n_kv_, head_dim_, n, qk_clip_, rms_eps_, kv_dst(q8(), B.plane, ring),
+                         pos_, k_, v_, st_);
+        inkling_clip_many(jobs, 2, n, pos_, st_);
+        dump("Qcur", v, q_, hq, n);
+        dump("Kcur", v, k_, hk, n);
+        dump("Vcur", v, v_, hk, n);
+        dump("Rcur", v, rel_, n_head_ * n_rel_, n);
+        const InklingAttnSeq c = attn_seq(q8(), B.plane, pos_, attn_room(B, n));
+        inkling_attend(q_, c.kcache, c.vcache, c.kq8, c.vq8, rel, sink_, pos_, n, att_, head_dim_, n_head_, n_kv_,
+                       scale, window, ring, awork_, awork_n_, st_, c.room);
+    }
     dump("kqv_out", v, att_, hq, n);
     mul_sigmoid(att_, gate_, hq, n, hq, false, st_);
     lin(B.wo, att_, o_, n);   // the post-convolution: layer_head(), with the residual
@@ -438,18 +501,21 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     // tail.
     const bool direct = n == 1;
     cres_ = direct ? stream(kCur) : res_;
+    tail_rows_ = rows_of_;   // step()'s rows, for the tail's convolution
     if (v == 0) {   // the embedding, normed, is the first block's start
         gather(kCur, o_, n);
         rms_norm(o_, fp(tok_norm_), res_, n_embd_, n, rms_eps_, st_);
         // a picture's rows go in as the encoder made them: llama.cpp norms token embeddings only (inkling2.cpp,
         // `if (ubatch.token)`).  A call can hold text and picture rows, so the raw rows are put back row by row.
-        for (const Image& im : images_) {
-            const int64_t a = std::max<int64_t>(im.at, pos_), b = std::min<int64_t>(im.at + im.n, pos_ + n);
-            if (a < b)
-                ck(cudaMemcpyAsync(res_ + (size_t) (a - pos_) * n_embd_, o_ + (size_t) (a - pos_) * n_embd_,
-                                   (size_t) (b - a) * n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
-                   "picture rows");
-        }
+        // step()'s rows have none (Engine::step()).
+        if (!rows_of_)
+            for (const Image& im : images_) {
+                const int64_t a = std::max<int64_t>(im.at, pos_), b = std::min<int64_t>(im.at + im.n, pos_ + n);
+                if (a < b)
+                    ck(cudaMemcpyAsync(res_ + (size_t) (a - pos_) * n_embd_, o_ + (size_t) (a - pos_) * n_embd_,
+                                       (size_t) (b - a) * n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+                       "picture rows");
+            }
         if (direct) ck(cudaMemcpyAsync(cres_, res_, e * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)), "streams");
         else scatter(kCur, res_, n);
     } else {
@@ -552,9 +618,9 @@ void Inkling::layer_head(Layer& L, int v, int n) {
             ck(cudaMemcpyAsync(blk_[k], res_, e * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)), "streams");
             bp[k] = blk_[k];
         }
-        inkling_conv(o_, post, fp(B.post_conv), nullptr, 0, cres_, n_embd_, n, st_);
+        post_conv(o_, post, B.post_conv, cres_, n, true, rows_of_);
     } else {
-        inkling_conv_acc(o_, post, fp(B.post_conv), nullptr, 0, cres_, n_embd_, n, st_);
+        post_conv(o_, post, B.post_conv, cres_, n, false, rows_of_);
     }
     dump("ffn_inp", v, cres_, n_embd_, n);
 
@@ -590,7 +656,8 @@ void Inkling::layer_tail(Layer&, int v, int n) {
     const size_t hk = (size_t) n_kv_ * head_dim_;
     dump("ffn_moe_out", v, fo_, n_embd_, n);
     float* const state = B.conv + (size_t) (n_conv_ - 1) * (2 * hk + n_embd_);
-    inkling_conv_acc(fo_, state, fp(B.ffn_post_conv), nullptr, 0, cres_, n_embd_, n, st_);
+    post_conv(fo_, state, B.ffn_post_conv, cres_, n, false, tail_rows_);
+    tail_rows_ = nullptr;
     if (cres_ == res_) scatter(kCur, res_, n);   // several tokens' stream back to r_ (one token's is worked on there)
     dump("l_out", v, cres_, n_embd_, n);
 }
