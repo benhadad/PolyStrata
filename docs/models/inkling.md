@@ -65,7 +65,8 @@ it also runs on one card (no layer split); setup leaves that option out for it. 
 8 GB card, use q8_0 for contexts past 32K. The file allows 1,048,576 tokens and the engine sets no limit of its own, but
 the cache stays in VRAM (about 17 KiB a token in q8_0; the engine's KV streaming is not wired up for this model), and it
 was tried up to a 128K context, with prompts of up to 35K tokens. Pictures are optional: see [Images](#images). It has
-no draft model, so it writes one token at a time.
+no draft model, so it writes one token at a time unless you let it guess from the conversation (`--window`, see
+[Guesses from the conversation](#guesses-from-the-conversation)).
 
 ## Install
 
@@ -126,6 +127,52 @@ Each slot takes VRAM from the expert cache at load: its 40 window layers' rows a
 caches `"parallel": 2` took about 0.5 GiB (it adds two sequences beside the first) and each slot after it about
 0.27 GiB (the experts the cache held less, at the average size of a cached expert). Its full-attention rows (17 KiB a
 token in q8_0) come out of the cache as its conversation grows, as the first request's do.
+
+## Guesses from the conversation
+
+With `--window 4` in the run config's `"args"` (`"--window", "4"`) the engine guesses what comes next where the
+answer repeats the conversation: after an earlier repeat of the last three tokens or more (`--lookup N`, default 3) it
+takes what followed as up to three guesses, and puts the known token and the guesses through the model together. A
+guess counts when the model would have written that token itself, so the answer is the one it writes without
+guesses. It is off by default: without `--window` the engine writes one token at a time, identical to `--window 1`.
+The file has no draft block, so the conversation is the only source of guesses.
+
+It pays where the answer copies text from the prompt, such as code given back with a change. Elsewhere it guesses
+rarely and costs about nothing. On a card that holds few of the experts it gains less: most experts of the guessed
+tokens run on the CPU, which takes about as long for a guessed token as for one alone.
+
+> **Measured on:** RTX 2070 Super 8 GB (Ryzen 5 3600XT, 62 GB DDR4), 128K context, q8_0 caches, the model's expert
+> profile; an RTX 3090 24 GB (rented, every expert of both sizes in VRAM), the same context and caches. Greedy answers
+> of 300 tokens, two runs each. "Code": a 373-token prompt that asks for a 25-line Python file back with a function
+> renamed; "text": a 37-token question on hash tables. The RTX 3090 rows are from an earlier build: the same window
+> code on an earlier revision of the batch slots.
+
+| | `--window 1` | `--window 4` | Guesses right |
+| --- | ---: | ---: | ---: |
+| RTX 2070 Super, IQ4_NL, code | 35.1-35.4 tokens/s | 38.8-40.0 | 102 of 119, 115 of 131 |
+| RTX 2070 Super, IQ4_NL, text | 36.7-37.8 | 36.7-37.2 | 2 of 12, 4 of 14 |
+| RTX 2070 Super, UD-Q2_K_XL, code | 47.1-47.4 | 47.9-48.1 | 40 of 60, 40 of 60 |
+| RTX 2070 Super, UD-Q2_K_XL, text | 48.2-48.4 | 48.8-48.8 | 14 of 19, 13 of 19 |
+| RTX 3090, IQ4_NL, code | 59.4-59.8 | 64.3-64.4 | 56 of 99 |
+| RTX 3090, IQ4_NL, text | 58.0-59.8 | 59.9-60.1 | 7 of 16 |
+| RTX 3090, UD-Q2_K_XL, code | 68.1-68.2 | 74.6-75.2 | 64 of 128 |
+| RTX 3090, UD-Q2_K_XL, text | 68.2-68.5 | 70.1-70.2 | 16 of 25 |
+
+With every expert on the CPU (`--no-gpu-experts`), `--window 4` wrote the same 200 tokens as `--window 1`, with the
+same five likeliest tokens and their probabilities at every step: IQ4_NL and UD-Q2_K_XL, three prompts each, greedy
+(RTX 2070 Super, q8_0 caches). `tools/window_agree.py` runs that check on a model and a prompt of your choice; on
+the code prompt (both sizes) and on its own repeated prompt (UD-Q2_K_XL) it found the same 200 tokens and five
+likeliest at every step, with 35 to 128 guesses right. With
+the card's expert cache holding the same experts (`STRATA_FREEZE_EXPERTS=1`, and for `--window 1` a larger
+`--vram-reserve-mib`, because a window's rows take VRAM from the cache), UD-Q2_K_XL's answers were the same too, code
+and text. Where the two caches held one expert apart (IQ4_NL: 1,006 and 1,007 of 3,072), they parted at a token the
+model rated about as likely as another.
+
+Without `--window`, 200 greedy tokens were compared with inkling2 791be9e's (the same tokens and twenty likeliest
+tokens with their probabilities): IQ4_NL and UD-Q2_K_XL, fp16 and q8_0 caches, code and text prompts, every expert on
+the CPU and with the cache holding the same experts. 15 of the 16 runs were identical. In the 16th (UD-Q2_K_XL, fp16,
+code, experts cached) the two caches never held the same experts (1,864 and 1,869 at load), and the answers first
+differ at a token the model rated about as likely as another (ln p1/p2 0.15).
 
 ## Images
 
