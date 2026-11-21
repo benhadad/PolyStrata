@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -601,7 +602,10 @@ protected:
     template <class F>
     void* record(F&& work);
     void moe_rows(Layer& L, int il, int n);
-    void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false);
+    void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false, uint8_t* to = nullptr);
+    void prestage(const Layer& L, int m, int n);
+    void settle_prestage();
+    int uncached(const Layer& L) const;
     void mind_memory();
     void follow(int written);
     void follow_loop();
@@ -746,6 +750,14 @@ protected:
     void act_rows(const float* gate_up, float* h, int rows, float limit, const ExpertScales* es);
     /// alloc(): MMQ's scratch taken before the expert cache is filled (Mmq::reserve_fixup()); Inkling 2's, else off
     bool reserve_mmq_ = false;
+    /// A read copies the next layer's experts that are not cached while a layer's calls run (prestage()); Inkling
+    /// 2's, else off: each layer's copy starts with the layer.
+    bool prestage_ = false;
+    /// moe_rows() hands the card a call's row tables by a kernel that reads them from pinned memory (copy2()), not
+    /// by a copy: the copies to the card went one after the other, and a read's tables (100 KB) waited behind its
+    /// rows of the residual (63 MiB a call of Inkling 2 Mini's at 1,024 tokens) and the next layer's experts
+    /// (prestage()).  Inkling 2's, else off.
+    bool kernel_tables_ = false;
     /// Q2_0 and IQ1_S experts on this project's kernels: the CPU's AVX2 dot products (cpu_lowbit.hpp) and Q2_0's MMQ
     /// tiles (Mmq::fits()).  Inkling 2's; off, those types take ggml-cpu's dot products and no tiles.
     bool lowbit_experts_ = false;
@@ -903,6 +915,18 @@ protected:
     void* ev_hr_ = nullptr;                       ///< marks the card's last read of h_r_ by draft_input()
     int staged_il_ = -1;                          ///< the layer whose experts the buffer holds for its next call, or -1
     std::vector<int32_t> staged_;                 ///< those experts, in the buffer's order: one round of the layer's
+    size_t stage_at_ = 0;                         ///< where in stage_ that round starts
+    struct Prestaged {
+        int il = -1;                              ///< the layer whose experts the copy is of, or -1
+        size_t at = 0;                            ///< where in stage_
+        std::vector<int32_t> experts;             ///< the layer's L.ahead when it was planned
+        int ev = 0;                               ///< which of ev_pre_ marks its end
+    } pre_;                                       ///< prestage()'s copy
+    std::thread pre_th_;                          ///< fills the pinned buffers for it
+    std::exception_ptr pre_err_;
+    /// mark the ends of those copies in turn: the next layer's copy starts before this one's calls wait for theirs
+    void* ev_pre_[2] = {};
+    int next_home_ = -1;                          ///< read(): the layer whose experts the next turn runs, or -1
     double ahead_ms_ = 0, route_ms_ = 0;          ///< what that layer's copy ahead took, and the card to its routing
     bool shared_ahead_ = false;                   ///< read() runs several calls: each copies ahead, whatever its size
     size_t stage_bytes_ = 0, chunk_bytes_ = 0;

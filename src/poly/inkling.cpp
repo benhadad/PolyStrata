@@ -169,6 +169,8 @@ void Inkling::load_geometry() {
     const MetaValue* scale = find("expert_weights_scale");
     w_scale_ = scale ? (float) scale->num() : 0.f;
     reserve_mmq_ = true;   // MMQ's scratch before the expert cache takes the VRAM
+    prestage_ = true;      // a read's next layer's experts come while a layer runs
+    kernel_tables_ = true;    // and a call's tables do not wait behind the copies to the card
     lowbit_experts_ = true;   // Unsloth's files: IQ1_S gate_up and Q2_0 down experts
 #if !defined(STRATA_USE_HIP)
     lane_slots_ = true;       // the cached experts' launches through MmvqSlots::lanes' kernels (measured on CUDA)

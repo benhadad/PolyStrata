@@ -656,6 +656,7 @@ Engine::~Engine() {
         swap_cv_.notify_all();
         follower_.join();
     }
+    if (pre_th_.joinable()) pre_th_.join();
     if (swap_st_) cudaStreamSynchronize(cs(swap_st_));
     if (up_) cudaStreamSynchronize(cs(up_));
     if (rs_) cudaStreamSynchronize(cs(rs_));
@@ -680,7 +681,8 @@ Engine::~Engine() {
     for (unsigned long long h : vpool_) cuMemRelease(h);   // the pool goes back to the card with the engine
     vpool_.clear();
     for (void* p : host_allocs_) cudaFreeHost(p);
-    for (void* e : {ev_stage_[0], ev_stage_[1], ev_ahead_, ev_free_, ev_in_[0], ev_in_[1], ev_out_[0], ev_out_[1], ev_hr_})
+    for (void* e : {ev_stage_[0], ev_stage_[1], ev_ahead_, ev_free_, ev_pre_[0], ev_pre_[1], ev_in_[0], ev_in_[1],
+                    ev_out_[0], ev_out_[1], ev_hr_})
         if (e) cudaEventDestroy((cudaEvent_t) e);
     for (void* e : swap_pin_ev_)
         if (e) cudaEventDestroy((cudaEvent_t) e);
@@ -2399,6 +2401,57 @@ void Engine::plan_ahead(Layer& L, int il) {
     L.ahead.resize(std::min(L.ahead.size(), stage_bytes_ / (L.gu_step + L.d_bytes)));
 }
 
+int Engine::uncached(const Layer& L) const {
+    return (int) std::count(L.slot.begin(), L.slot.end(), nullptr);
+}
+
+// In a read, the experts of the next turn's layer (next_home_) that are not cached go to the staging buffer while
+// the m of layer L are read there by the turn's calls: before the buffer's start if they fit there, else after
+// L's.  The part they take was the layer's before L, whose last call the copy waits for (ev_free_ has its mark
+// until L's first call is done).  Where they do not fit, the next layer copies them when it starts, as without
+// this.  The experts and the launches are the same either way, so the results are too.
+//
+// On an RTX 2070 Super (PCIe 3.0 x16), with 1,042 of Inkling 2 Mini IQ4_NL's 3,072 experts cached, a read copies
+// 18.7 GB, 1.4 s at 13.1 GB/s.  In a 2,048-token prompt read in 2.5 s the card still waits 0.54 s for those
+// copies: the layers outside the loop have about 500 MB each not cached, and two of them together do not fit the
+// 627 MB buffer.
+void Engine::prestage(const Layer& L, int m, int n) {
+    Layer& N = layers_[(size_t) next_home_];
+    if (!batched(N, n)) return;
+    plan_ahead(N, next_home_);
+    const int m2 = (int) N.ahead.size();
+    if (m2 == 0 || m2 != uncached(N)) return;
+    const size_t span = pad((size_t) m * L.gu_step) + (size_t) m * L.d_bytes + kTail;
+    const size_t span2 = pad((size_t) m2 * N.gu_step) + (size_t) m2 * N.d_bytes + kTail;
+    const size_t room = stage_bytes_ + 256 + kTail, after = pad(stage_at_ + span);
+    size_t at = 0;
+    if (span2 > stage_at_) {
+        if (after + span2 > room) return;
+        at = after;
+    }
+    pre_.il = next_home_;
+    pre_.at = at;
+    pre_.experts = N.ahead;
+    pre_.ev ^= 1;
+    ck(cudaStreamWaitEvent(cs(up_), (cudaEvent_t) ev_free_, 0), "expert staging");
+    if (!stagers_) stagers_ = std::make_unique<Workers>(4);
+    pre_th_ = std::thread([this, &N, at, ev = ev_pre_[pre_.ev]] {
+        try {
+            cudaSetDevice(device_);   // a thread starts on card 0
+            stage(N, pre_.experts.data(), (int) pre_.experts.size(), up_, true, stage_ + at);
+            ck(cudaEventRecord((cudaEvent_t) ev, cs(up_)), "expert staging");
+        } catch (...) {
+            pre_err_ = std::current_exception();
+        }
+    });
+}
+
+// The copy prestage() started is on its way: what is left of it is the card's.
+void Engine::settle_prestage() {
+    if (pre_th_.joinable()) pre_th_.join();
+    if (pre_err_) std::rethrow_exception(std::exchange(pre_err_, nullptr));
+}
+
 // The follower: an asked-for expert goes from the mapped file to a pinned buffer, and from there to its slot.
 // The file may have to be read for it, which is why this is not the engine's thread.  Two buffers take turns: an
 // expert is copied into one while the other uploads, and the upload is the quicker of the two.  (A buffer for
@@ -3227,7 +3280,7 @@ void Engine::alloc() {
         if (!opt_.metal_balanced)
 #endif
             ensure_stage();
-        for (void** e : {&ev_stage_[0], &ev_stage_[1], &ev_ahead_, &ev_free_}) {
+        for (void** e : {&ev_stage_[0], &ev_stage_[1], &ev_ahead_, &ev_free_, &ev_pre_[0], &ev_pre_[1]}) {
             cudaEvent_t ev = nullptr;
             ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
             *e = ev;
@@ -4391,9 +4444,14 @@ bool Engine::moe_card(Layer& L, int il, int n) {
 
 // m experts from the mapped file into the staging buffer: gate and up of each back to back from the start, the
 // downs after them.  The two pinned buffers take turns, so the workers fill one while the other uploads.  `alone`:
-// stagers_ fill them, while the workers compute experts.
-void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone) {
-    staged_il_ = -1;   // whatever the buffer held
+// stagers_ fill them, while the workers compute experts.  `to`: a place in the buffer for the next layer's
+// experts, copied while this one's are read (prestage()).
+void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone, uint8_t* to) {
+    if (!to) {
+        staged_il_ = -1;   // whatever the buffer held
+        stage_at_ = 0;
+        to = stage_;
+    }
     const size_t step = L.gu_step, down_at = pad((size_t) m * step);
     const int per = (int) (chunk_bytes_ / (step + L.d_bytes));
     for (int j0 = 0; j0 < m; j0 += per) {
@@ -4422,14 +4480,13 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
             else get(h + c * step + j * L.d_bytes, L.exp_down + e * L.d_bytes, L.d_bytes, L.gu2());
         };
         (alone ? *stagers_ : *workers_).run((int) (3 * c), copy);
-        ck(cudaMemcpyAsync(stage_ + (size_t) j0 * step, h, c * step, cudaMemcpyHostToDevice, cs(stream)),
-           "expert staging");
-        ck(cudaMemcpyAsync(stage_ + down_at + (size_t) j0 * L.d_bytes, h + c * step, c * L.d_bytes,
-                           cudaMemcpyHostToDevice, cs(stream)),
+        ck(cudaMemcpyAsync(to + (size_t) j0 * step, h, c * step, cudaMemcpyHostToDevice, cs(stream)), "expert staging");
+        ck(cudaMemcpyAsync(to + down_at + (size_t) j0 * L.d_bytes, h + c * step, c * L.d_bytes, cudaMemcpyHostToDevice,
+                           cs(stream)),
            "expert staging");
         ck(cudaEventRecord(left, cs(stream)), "expert staging");
     }
-    ck(cudaMemsetAsync(stage_ + down_at + (size_t) m * L.d_bytes, 0, kTail, cs(stream)), "expert staging");
+    ck(cudaMemsetAsync(to + down_at + (size_t) m * L.d_bytes, 0, kTail, cs(stream)), "expert staging");
 }
 
 // A MoE layer for a prompt batch: the experts on the GPU, by llama.cpp's MMQ.  A row is a token and one
@@ -4487,7 +4544,13 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     // request's: a frozen answer takes the staging as it finds it, which is what the first token saw.
     const bool mine = ahead && staged_il_ == il &&
                       (staged_ == L.ahead || (freeze_experts_ ? true : 2 * route_ms_ < ahead_ms_));
-    const bool early = n_ahead > 0 && !mine;
+    // The layer before may have copied them (prestage()), where the buffer had room beside its own.
+    if (pre_.il >= 0 && !mine) settle_prestage();
+    const bool pre = n_ahead > 0 && !mine && pre_.il == il && pre_.experts == L.ahead;
+    if (pre) stage_at_ = pre_.at;
+    void* const pre_done = ev_pre_[pre_.ev];   // before prestage() below starts the next one's
+    pre_.il = mine ? pre_.il : -1;
+    const bool early = n_ahead > 0 && !mine && !pre;
     if (early) {
         const Clock::time_point t = Clock::now();
         // the buffer is free once the layer before has read it
@@ -4501,9 +4564,13 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         }
     }
 
+    // The next layer's copy runs while this one's calls are read, if every expert of both that is not cached
+    // goes in the buffer, and nothing of this layer's is copied after it (its later calls find theirs there).
+    if ((early || pre) && prestage_ && next_home_ >= 0 && n_ahead == uncached(L)) prestage(L, n_ahead, n);
+
     const Clock::time_point t0 = Clock::now();
     ck(cudaEventSynchronize((cudaEvent_t) ev_), "router");
-    if (ahead && !early && !freeze_experts_) route_ms_ = ms_since(t0);
+    if (ahead && !early && !pre && !freeze_experts_) route_ms_ = ms_since(t0);
     stats_.route_wait_ms += ms_since(t0);
 
     const size_t cb_row = (size_t) n_expert_ + 1;
@@ -4666,13 +4733,17 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         }
         b[n_chan] = at;
     }
-    ck(cudaMemcpyAsync(tab_, h_tab_,
-                       (3 * cap + 3 * (size_t) n_expert_ + 3 + kClasses * cb_row + 2 * n_tile * tile_row * (n_tile > 1)) *
-                           sizeof(int32_t),
-                       cudaMemcpyHostToDevice, cs(st_)),
-       "expert rows");
-    if ((es.gate || es.up) && rg > 0)
-        ck(cudaMemcpyAsync(d_ex_, h_ex_, (size_t) rg * sizeof(int32_t), cudaMemcpyHostToDevice, cs(st_)), "expert rows");
+    const size_t n_tab =
+        3 * cap + 3 * (size_t) n_expert_ + 3 + kClasses * cb_row + 2 * n_tile * tile_row * (n_tile > 1);
+    const int n_ex = (es.gate || es.up) && rg > 0 ? rg : 0;
+    if (kernel_tables_) {
+        copy2(h_tab_, tab_, (int) n_tab, h_ex_, d_ex_, n_ex, st_);
+    } else {
+        ck(cudaMemcpyAsync(tab_, h_tab_, n_tab * sizeof(int32_t), cudaMemcpyHostToDevice, cs(st_)), "expert rows");
+        if (n_ex > 0)
+            ck(cudaMemcpyAsync(d_ex_, h_ex_, (size_t) n_ex * sizeof(int32_t), cudaMemcpyHostToDevice, cs(st_)),
+               "expert rows");
+    }
 
     const int rc = bounds[n_cached];   // the rows of the cached experts
     stats_.batch_cached += rc;
@@ -4750,7 +4821,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             if ((size_t) (last - first) == staged_.size() && std::equal(first, last, staged_.begin())) kept = r;
         }
         const int from = mine && kept < 0 ? 1 : 0;
-        holds = early ? 0 : kept;
+        holds = early || pre ? 0 : kept;
         for (int turn = 0; turn < n_round; ++turn) {
             const int r = kept < 0 ? (turn + from) % n_round : turn == 0 ? kept : turn - (turn <= kept ? 1 : 0);
             const int g0 = round_[(size_t) r], m = round_[(size_t) r + 1] - g0;
@@ -4758,9 +4829,10 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             const int r0 = round_row_[(size_t) r], rows = round_row_[(size_t) r + 1] - r0;
             if (r == kept) {
                 // the buffer has it
-            } else if (r == 0 && early) {
-                ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_ahead_, 0), "expert staging");
+            } else if (r == 0 && (early || pre)) {
+                ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) (pre ? pre_done : ev_ahead_), 0), "expert staging");
             } else if (rows > 0) {
+                if (pre_th_.joinable()) settle_prestage();   // the pinned buffers are the copy's
                 stage(L, group_.data() + g0, m, st_, n_cpu > 0);
                 holds = r;
             }
@@ -4777,10 +4849,11 @@ void Engine::moe_rows(Layer& L, int il, int n) {
                     if (top > 0) launch(k, top);
                 }
             };
+            uint8_t* const sb = stage_ + stage_at_;
             each_class([&](int k, int top) {
                 const int32_t* b = n_tile == 1 ? d_bounds + g0 : d_tb + (size_t) k * tile_row + (size_t) (g0 - n_cached + r);
-                mmq_->mul(stage_, gt, gu_rows, n_embd_, step, m, mq_, b, iota_, rg, top, gu_, ff2, st_);
-                up_mul(stage_, step, m, b, top);
+                mmq_->mul(sb, gt, gu_rows, n_embd_, step, m, mq_, b, iota_, rg, top, gu_, ff2, st_);
+                up_mul(sb, step, m, b, top);
             });
             ExpertScales er = es;
             if (er.ids) er.ids += r0;
@@ -4790,7 +4863,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             each_class([&](int k, int top) {
                 const int32_t* b = (n_tile == 1 ? d_rel + (g0 - n_cached + r)
                                                 : d_tb + (size_t) (n_tile + k) * tile_row + (size_t) (g0 - n_cached + r));
-                mmq_->mul(stage_ + down_at, dt, n_embd_, ff, L.d_bytes, m, mq2_, b, d_place + r0, rows, top, dx_, n_embd_,
+                mmq_->mul(sb + down_at, dt, n_embd_, ff, L.d_bytes, m, mq2_, b, d_place + r0, rows, top, dx_, n_embd_,
                           st_);
             });
             if (guard) scale_rows(dx_, n_embd_, n_embd_, rows, d_place + r0, hf_ + r0, false, st_);
@@ -5623,6 +5696,9 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
             // Between two turns the caller may give the read up.  The layers so far have the read's tokens in
             // their state and the others have not: the sequence cannot go on from here, nor from where it was.
             if (turn && k > 0 && !(*turn)(k, turns)) {
+                settle_prestage();
+                pre_.il = next_home_ = -1;
+                if (up_) ck(cudaStreamSynchronize(cs(up_)), "read");   // the copy no turn takes ends before another
                 if (host) ck(cudaStreamSynchronize(cs(rs_)), "read");
                 ck(cudaStreamSynchronize(cs(st_)), "read");
                 shared_ahead_ = false;
@@ -5637,6 +5713,9 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                 tok_ = tokens + call.at;
                 if (host) ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_in_[c % 2], 0), "read");
                 if (il < n_layer_) {
+                    const int on = il + 1;   // the layer of the next turn, whose experts may come meanwhile
+                    next_home_ =
+                        prestage_ && on < hi_ && on < n_layer_ && routed(layers_[(size_t) on]) ? home_of(on) : -1;
                     layer(il, call.m);
                 } else {
                     output_rows(0, call.m, hn_ + n_embd_);
@@ -5676,12 +5755,18 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
             ck(cudaStreamSynchronize(cs(st_)), "the next card");
         }
     } catch (...) {
+        if (pre_th_.joinable()) pre_th_.join();
+        pre_err_ = nullptr;
+        pre_.il = next_home_ = -1;
+        if (up_) cudaStreamSynchronize(cs(up_));
         if (host) cudaStreamSynchronize(cs(rs_));
         shared_ahead_ = false;
         r_ = r0;
         pos_ = pos0;
         throw;
     }
+    settle_prestage();
+    pre_.il = next_home_ = -1;
     shared_ahead_ = false;
     r_ = r0;
     pos_ = pos0;
