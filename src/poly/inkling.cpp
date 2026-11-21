@@ -441,6 +441,15 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     if (v == 0) {   // the embedding, normed, is the first block's start
         gather(kCur, o_, n);
         rms_norm(o_, fp(tok_norm_), res_, n_embd_, n, rms_eps_, st_);
+        // a picture's rows go in as the encoder made them: llama.cpp norms token embeddings only (inkling2.cpp,
+        // `if (ubatch.token)`).  A call can hold text and picture rows, so the raw rows are put back row by row.
+        for (const Image& im : images_) {
+            const int64_t a = std::max<int64_t>(im.at, pos_), b = std::min<int64_t>(im.at + im.n, pos_ + n);
+            if (a < b)
+                ck(cudaMemcpyAsync(res_ + (size_t) (a - pos_) * n_embd_, o_ + (size_t) (a - pos_) * n_embd_,
+                                   (size_t) (b - a) * n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+                   "picture rows");
+        }
         if (direct) ck(cudaMemcpyAsync(cres_, res_, e * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)), "streams");
         else scatter(kCur, res_, n);
     } else {

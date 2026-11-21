@@ -39,6 +39,7 @@ protected:
     size_t recurrent_floats() const override;
     void alloc_caches() override;
     void assign_scratch() override;
+    bool sees() const override { return true; }   // pictures (strata-vision's rows) in place of tokens
     int widest() const override { return std::max(n_head_ * head_dim_, 2 * n_embd_); }
     int streams() const override { return kStreams; }
     void layer_head(Layer& L, int il, int n) override;
