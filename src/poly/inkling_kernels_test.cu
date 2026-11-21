@@ -2,7 +2,8 @@
 // the host in double precision, on random inputs of the model's shapes: the clips and tau, the short convolutions
 // (with and without the input-dependent taps, walked and parallel, and their state), the depth mix, the loop
 // controller, SiTU, and the attention over fp16 and Q8_0 caches, full and sliding-window (a ring), split and
-// unsplit, with and without a room past the call, for 1, 7 and more than 1,024 tokens.
+// unsplit, with and without a room past the call, for 1, 7 and more than 1,024 tokens; and the calls for a token of
+// each of several sequences (Engine::step()'s rows) against a call for each row alone, to the bit.
 //
 // usage: poly_inkling_kernels_test [bench | decode]   (exit 0: every check within its tolerance; 77: no usable card;
 //        bench: also time the attention and the decode shapes; decode: only the decode-shape timings)
@@ -18,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -713,6 +715,201 @@ void test_kv_store(int rows, bool q8, bool taps, int ring, long long pos) {
         cudaFree(vo);
 }
 
+// ---- a token of each of several sequences (Engine::step()'s rows) -------------------------------------------------
+//
+// Each _seqs call against the single-sequence call of each row alone, to the bit: a sequence's token is then the
+// same in a batch as alone.  The rows' positions are spread over the window's edge, the ring's wrap and the full
+// visits' room steps.
+
+const std::vector<long long> kSeqPos = {0, 5, 1023, 1024, 1500, 2047, 2049, 4100, 70};
+
+void test_clip_many_seqs(int rows) {
+    const InklingTau tau{0.1f, 8192};
+    auto q = randv(size_t(rows) * 3072, 2.0f), r = randv(size_t(rows) * 384, 2.0f), qs = randv(3072, 0.3f, 1.f),
+         rs = randv(384, 0.3f, 1.f);
+    float *dq = up(q), *dr = up(r), *dqs = up(qs), *drs = up(rs), *y1, *y2;
+    ck(cudaMalloc(&y1, (q.size() + r.size()) * 4), "malloc"), ck(cudaMalloc(&y2, (q.size() + r.size()) * 4), "malloc");
+    std::vector<int64_t> pos(rows);
+    for (int t = 0; t < rows; ++t) pos[t] = kSeqPos[t % kSeqPos.size()] * 7 + t;   // past tau's floor too
+    auto jobs = [&](float* y, size_t t) {
+        static InklingClipJob j[2];
+        j[0] = {}, j[1] = {};
+        j[0].x = dq + t * 3072, j[0].scale = dqs, j[0].y = y + t * 3072, j[0].dim = 128, j[0].heads = 24;
+        j[0].threshold = 22.6f, j[0].tau = tau;
+        j[1].x = dr + t * 384, j[1].scale = drs, j[1].y = y + q.size() + t * 384, j[1].dim = 16, j[1].heads = 24;
+        j[1].threshold = 8.f, j[1].tau = tau;
+        return j;
+    };
+    for (int t = 0; t < rows; ++t) inkling_clip_many(jobs(y1, size_t(t)), 2, 1, pos[t], nullptr);
+    inkling_clip_many_seqs(jobs(y2, 0), 2, rows, pos.data(), nullptr);
+    same_bits(("clip_many_seqs vs a row at a time, rows " + std::to_string(rows)).c_str(), y1, y2,
+              q.size() + r.size());
+    cudaFree(dq), cudaFree(dr), cudaFree(dqs), cudaFree(drs), cudaFree(y1), cudaFree(y2);
+}
+
+void test_conv_seqs(bool acc, int rows) {
+    const int channels = 2304;
+    auto x = randv(size_t(rows) * channels, 1.f), w = randv(size_t(channels) * 4, 0.4f),
+         st = randv(size_t(rows) * channels * 3, 1.f), o = randv(size_t(rows) * channels, 1.f);
+    float *dx = up(x), *dw = up(w), *s1 = up(st), *s2 = up(st), *o1 = up(o), *o2 = up(o);
+    std::vector<float*> states(rows);
+    for (int t = 0; t < rows; ++t) {
+        const size_t xo = size_t(t) * channels, so = size_t(t) * channels * 3;
+        if (acc) inkling_conv_acc(dx + xo, s1 + so, dw, nullptr, 0, o1 + xo, channels, 1, nullptr);
+        else inkling_conv(dx + xo, s1 + so, dw, nullptr, 0, o1 + xo, channels, 1, nullptr);
+        states[t] = s2 + so;
+    }
+    if (acc) inkling_conv_acc_seqs(dx, states.data(), dw, o2, channels, rows, nullptr);
+    else inkling_conv_seqs(dx, states.data(), dw, o2, channels, rows, nullptr);
+    const std::string name = std::string(acc ? "conv_acc_seqs" : "conv_seqs") + " vs a row at a time, rows " +
+                             std::to_string(rows);
+    same_bits((name + ": out").c_str(), o1, o2, o.size());
+    same_bits((name + ": state").c_str(), s1, s2, st.size());
+    cudaFree(dx), cudaFree(dw), cudaFree(s1), cudaFree(s2), cudaFree(o1), cudaFree(o2);
+}
+
+// the bytes of two device buffers
+size_t bytes_differ(const void* a, const void* b, size_t bytes) {
+    std::vector<uint8_t> x(bytes), y(bytes);
+    ck(cudaDeviceSynchronize(), "sync");
+    ck(cudaMemcpy(x.data(), a, bytes, cudaMemcpyDeviceToHost), "download");
+    ck(cudaMemcpy(y.data(), b, bytes, cudaMemcpyDeviceToHost), "download");
+    size_t diff = 0;
+    for (size_t i = 0; i < bytes; ++i) diff += x[i] != y[i];
+    return diff;
+}
+
+size_t caches_differ(const Cache& a, const Cache& b) {
+    const size_t vals = size_t(a.rows_cap) * kKv * kDim;
+    if (a.q8)
+        return bytes_differ(a.kc, b.kc, vals) + bytes_differ(a.vc, b.vc, vals) + bytes_differ(a.ks, b.ks, vals / 16) +
+               bytes_differ(a.vs, b.vs, vals / 16);
+    return bytes_differ(a.k, b.k, vals * 2) + bytes_differ(a.v, b.v, vals * 2);
+}
+
+void test_kv_store_seqs(int rows, bool q8, bool taps, int ring) {
+    const int width = kKv * kDim;
+    auto kraw = randv(size_t(rows) * width, 1.f), vraw = randv(size_t(rows) * width, 1.f),
+         kw = randv(size_t(width) * 4, 0.4f), vw = randv(size_t(width) * 4, 0.4f),
+         kt = randv(size_t(rows) * kKv * 4, 0.3f), vt = randv(size_t(rows) * kKv * 4, 0.3f),
+         st = randv(size_t(rows) * width * 6, 1.f);
+    for (size_t i = 0; i < kraw.size(); i += 7) kraw[i] *= 8.f;
+    float *dk = up(kraw), *dv = up(vraw), *dkw = up(kw), *dvw = up(vw), *dkt = up(kt), *dvt = up(vt);
+    float *s1 = up(st), *s2 = up(st), *ko1, *vo1, *ko2, *vo2;
+    for (float** p : {&ko1, &vo1, &ko2, &vo2}) ck(cudaMalloc(p, kraw.size() * 4), "malloc");
+    std::vector<Cache> c1(rows), c2(rows);
+    std::vector<InklingKvSeq> seqs(rows);
+    for (int t = 0; t < rows; ++t) {
+        const long long pos = kSeqPos[t % kSeqPos.size()];
+        const int cap = ring ? ring : int(pos) + 1;
+        c1[t].alloc(cap, q8), c2[t].alloc(cap, q8);
+        InklingKvDst d1, d2;
+        d1.k = c1[t].k, d1.v = c1[t].v, d1.kc = c1[t].kc, d1.ks = c1[t].ks, d1.vc = c1[t].vc, d1.vs = c1[t].vs;
+        d2.k = c2[t].k, d2.v = c2[t].v, d2.kc = c2[t].kc, d2.ks = c2[t].ks, d2.vc = c2[t].vc, d2.vs = c2[t].vs;
+        d1.ring = d2.ring = ring;
+        const size_t xo = size_t(t) * width, so = size_t(t) * width * 6, to = size_t(t) * kKv * 4;
+        inkling_kv_store(dk + xo, dv + xo, s1 + so, s1 + so + width * 3, dkw, dvw, taps ? dkt + to : nullptr,
+                         taps ? dvt + to : nullptr, kKv, kDim, 1, 22.6f, 1e-6f, d1, pos, ko1 + xo, vo1 + xo, nullptr);
+        seqs[t].dst = d2, seqs[t].k_state = s2 + so, seqs[t].v_state = s2 + so + width * 3, seqs[t].pos = pos;
+    }
+    inkling_kv_store_seqs(dk, dv, seqs.data(), dkw, dvw, taps ? dkt : nullptr, taps ? dvt : nullptr, kKv, kDim, rows,
+                          22.6f, 1e-6f, ko2, vo2, nullptr);
+    const std::string name = std::string("kv_store_seqs vs a row at a time, rows ") + std::to_string(rows) +
+                             (q8 ? " q8_0" : " fp16") + (taps ? " taps" : "") + (ring ? " ring" : "");
+    same_bits((name + ": K").c_str(), ko1, ko2, kraw.size());
+    same_bits((name + ": V").c_str(), vo1, vo2, vraw.size());
+    same_bits((name + ": state").c_str(), s1, s2, st.size());
+    size_t diff = 0;
+    for (int t = 0; t < rows; ++t) diff += caches_differ(c1[t], c2[t]);
+    std::printf("%-58s %zu bytes differ  %s\n", (name + ": caches").c_str(), diff, diff ? "FAIL" : "ok");
+    if (diff) ++failures;
+    for (int t = 0; t < rows; ++t) c1[t].free_(), c2[t].free_();
+    for (float* p : {dk, dv, dkw, dvw, dkt, dvt, s1, s2, ko1, vo1, ko2, vo2}) cudaFree(p);
+}
+
+// Each row its own cache of pos + 1 rows; full rows sized as Engine::room(1) sizes them, window rows for the
+// context, as Inkling::attn() does.  `alone`: rows before position 32 get no room (pos + 1, one split), so that a
+// call has rows of one split beside rows of several.
+void test_attend_seqs(int rows, bool q8, int window, const std::vector<float>& table, float* dtable,
+                      const std::vector<long long>& at = kSeqPos, long long context = 8192, bool alone = false) {
+    const int ring = window ? window + 1024 : 0;
+    std::vector<Cache> c(rows);
+    std::vector<InklingAttnSeq> seqs(rows);
+    for (int t = 0; t < rows; ++t) {
+        const long long pos = at[t % at.size()];
+        c[t].alloc(ring ? ring : int(pos) + 1, q8);
+        auto k = randv(size_t(pos + 1) * kKv * kDim, 1.2f), v = randv(size_t(pos + 1) * kKv * kDim, 1.0f);
+        float *dk = up(k), *dv = up(v);
+        c[t].store(dk, dv, 0, int(pos) + 1, ring);
+        cudaFree(dk), cudaFree(dv);
+        InklingAttnSeq& s = seqs[t];
+        s.kcache = c[t].k, s.vcache = c[t].v;
+        if (q8) s.kq8 = {c[t].kc, c[t].ks}, s.vq8 = {c[t].vc, c[t].vs};
+        s.pos = pos;
+        long long room = 1024;
+        while (room < pos + 1) room *= 2;
+        s.room = alone && pos < 32 ? 0 : window ? context : std::min(room, context);
+    }
+    auto q = randv(size_t(rows) * kHeads * kDim, 1.2f), r = randv(size_t(rows) * kHeads * kRel, 1.5f),
+         sk = randv(size_t(rows) * kHeads, 2.0f, 1.0f);
+    float *dq = up(q), *dr = up(r), *ds = up(sk), *o1, *o2, *work;
+    ck(cudaMalloc(&o1, q.size() * 4), "malloc"), ck(cudaMalloc(&o2, q.size() * 4), "malloc");
+    const size_t wn = inkling_attend_work_floats(kHeads, kDim);
+    ck(cudaMalloc(&work, wn * 4), "malloc");
+    const float scale = 1.f / std::sqrt((float) kDim);
+    for (int t = 0; t < rows; ++t) {
+        const InklingAttnSeq& s = seqs[t];
+        inkling_attend(dq + size_t(t) * kHeads * kDim, s.kcache, s.vcache, s.kq8, s.vq8,
+                       {dr + size_t(t) * kHeads * kRel, dtable, kRel, kExtent}, ds + size_t(t) * kHeads, s.pos, 1,
+                       o1 + size_t(t) * kHeads * kDim, kDim, kHeads, kKv, scale, window, ring, work, wn, nullptr,
+                       s.room);
+    }
+    inkling_attend_seqs(dq, seqs.data(), rows, {dr, dtable, kRel, kExtent}, ds, o2, kDim, kHeads, kKv, scale, window,
+                        ring, work, wn, nullptr);
+    const std::string name = std::string("attend_seqs vs a row at a time, rows ") + std::to_string(rows) +
+                             (q8 ? " q8_0" : " fp16") + (window ? " window" : " full") +
+                             (alone ? ", 1 split and more" : "") + (context > 8192 ? ", 128K" : "");
+    same_bits(name.c_str(), o1, o2, q.size());
+    for (Cache& x : c) x.free_();
+    cudaFree(dq), cudaFree(dr), cudaFree(ds), cudaFree(o1), cudaFree(o2), cudaFree(work);
+}
+
+// More rows than kInklingSeqRows: each _seqs call refuses them.
+void test_seqs_refuse_rows() {
+    const int rows = kInklingSeqRows + 1;
+    std::vector<int64_t> pos(rows, 0);
+    std::vector<float*> states(rows, nullptr);
+    std::vector<InklingKvSeq> kv(rows);
+    std::vector<InklingAttnSeq> at(rows);
+    InklingClipJob job;
+    job.dim = 128, job.heads = 1;
+    float* work = nullptr;
+    ck(cudaMalloc(&work, 4), "malloc");
+    int refused = 0;
+    const auto count = [&](auto&& f) {
+        try {
+            f();
+        } catch (const std::invalid_argument&) {
+            ++refused;
+        }
+    };
+    count([&] { inkling_clip_many_seqs(&job, 1, rows, pos.data(), nullptr); });
+    count([&] { inkling_conv_seqs(nullptr, states.data(), nullptr, nullptr, 2304, rows, nullptr); });
+    count([&] { inkling_conv_acc_seqs(nullptr, states.data(), nullptr, nullptr, 2304, rows, nullptr); });
+    count([&] {
+        inkling_kv_store_seqs(nullptr, nullptr, kv.data(), nullptr, nullptr, nullptr, nullptr, kKv, kDim, rows, 1.f,
+                              1e-6f, nullptr, nullptr, nullptr);
+    });
+    count([&] {
+        inkling_attend_seqs(nullptr, at.data(), rows, {nullptr, work, 0, kExtent}, nullptr, nullptr, kDim, kHeads, kKv,
+                            1.f, 0, 0, work, 1, nullptr);
+    });
+    ck(cudaGetLastError(), "refuse");
+    std::printf("%-58s %d of 5 refused  %s\n", "the _seqs calls refuse 17 rows", refused, refused == 5 ? "ok" : "FAIL");
+    if (refused != 5) ++failures;
+    cudaFree(work);
+}
+
 // Timings at decode shapes (with `bench`): the per-token kernels as the engine calls them for one token.  Each
 // case runs `reps` times as one CUDA graph (no host launch cost between the calls), replayed 5 times; the fastest
 // replay is reported.  The functions take the stream the graph is captured on.
@@ -1010,6 +1207,22 @@ int main(int argc, char** argv) {
     };
     for (const AttnCase& tc : cases) test_attend(tc, table, dtable);
     test_attend_alone(table, dtable);
+
+    for (int rows : {1, 4, 9, kInklingSeqRows}) test_clip_many_seqs(rows);
+    for (bool acc : {false, true})
+        for (int rows : {1, 9, kInklingSeqRows}) test_conv_seqs(acc, rows);
+    test_kv_store_seqs(1, false, true, 0);
+    test_kv_store_seqs(9, false, true, 0);
+    test_kv_store_seqs(9, true, true, 0);
+    test_kv_store_seqs(9, false, false, 2048);
+    test_kv_store_seqs(9, true, false, 2048);
+    test_kv_store_seqs(kInklingSeqRows, true, true, 0);
+    for (bool q8 : {false, true})
+        for (int window : {0, 1024})
+            for (int rows : {1, 3, 9, kInklingSeqRows}) test_attend_seqs(rows, q8, window, table, dtable);
+    for (int window : {0, 1024}) test_attend_seqs(9, false, window, table, dtable, kSeqPos, 8192, true);
+    test_attend_seqs(2, true, 0, table, dtable, {131000, 70}, 131072);   // the largest split of a 128K context
+    test_seqs_refuse_rows();
     if (bench) bench_attend(table, dtable), bench_decode(table, dtable);
     cudaFree(dtable);
 

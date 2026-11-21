@@ -100,6 +100,10 @@
 //                                                              experts have their own)
 //   expert sum                                                 the engine's moe_sum(), from zero (no shared expert)
 //   final softcap (30)                                         softcap()
+//   step()'s rows (--batch), each of its own sequence: K/V,    inkling_kv_store_seqs(), inkling_clip_many_seqs(),
+//   tau, attention and the post-convolutions with each row's   inkling_attend_seqs(), inkling_conv_seqs(),
+//   caches, state and position; the rest as above, once       inkling_conv_acc_seqs()
+//   for all the rows
 #pragma once
 
 #include "strata/poly/kernels.hpp"
@@ -284,6 +288,57 @@ void inkling_kv_store(const float* kraw, const float* vraw, float* k_state, floa
 /// axpy(out, 1, acc, add).
 void inkling_conv_acc(const float* x, float* state, const float* w, const float* taps, int heads, float* acc,
                       int channels, int rows, void* stream);
+
+// ---- a token of each of several sequences --------------------------------------------------------------------
+//
+// Engine::step()'s rows (--batch): row t of a call is the next token of a sequence of its own, with that sequence's
+// caches, convolution state and position.  Each call below gives a row the same bits as the call above it gives
+// that row alone (rows 1, the row's own state, caches and position), in one launch for all the rows.
+
+/// The most rows of these calls.
+inline constexpr int kInklingSeqRows = 16;
+
+/// inkling_clip_many() for rows each at its own position: row t's tau is at pos[t] (host array of rows values).
+void inkling_clip_many_seqs(const InklingClipJob* jobs, int count, int rows, const int64_t* pos, void* stream);
+
+/// A row's destination and state in inkling_kv_store_seqs(): its sequence's cache (ring as InklingKvDst's), the K
+/// and V convolutions' states, and its position.
+struct InklingKvSeq {
+    InklingKvDst dst;
+    float* k_state = nullptr;
+    float* v_state = nullptr;
+    int64_t pos = 0;
+};
+/// inkling_kv_store() of one token for each of `rows` rows (seqs: a host array), into each row's own cache and
+/// state.  The rest as inkling_kv_store()'s; k_out / v_out may be null.
+void inkling_kv_store_seqs(const float* kraw, const float* vraw, const InklingKvSeq* seqs, const float* k_w,
+                           const float* v_w, const float* k_taps, const float* v_taps, int kv_heads, int dim,
+                           int rows, float k_clip, float eps, float* k_out, float* v_out, void* stream);
+
+/// A row's caches in inkling_attend_seqs(): its sequence's (fp16, or Q8_0 where the codes are not null), its
+/// position and the room it is sized for (inkling_attend()'s room; 0: pos + 1).
+struct InklingAttnSeq {
+    const uint16_t* kcache = nullptr;
+    const uint16_t* vcache = nullptr;
+    Kvq8 kq8, vq8;
+    int64_t pos = 0;
+    int64_t room = 0;
+};
+/// inkling_attend()'s split path for one token of each of `rows` rows (seqs: a host array), each against its own
+/// caches at its own position, split as inkling_attend() splits that row alone.  Every row's caches are fp16, or
+/// every row's Q8_0 (the same --kv for all).  q, rel.r, sinks and out hold the rows one after the other, as
+/// inkling_attend()'s tokens.  work: inkling_attend_work_floats() floats (not null).  Throws
+/// std::invalid_argument for more than kInklingSeqRows rows or caches of mixed kinds.
+void inkling_attend_seqs(const float* q, const InklingAttnSeq* seqs, int rows, InklingRel rel, const float* sinks,
+                         float* out, int dim, int n_head, int kv_heads, float scale, int window, int ring,
+                         float* work, size_t work_floats, void* stream);
+
+/// inkling_conv() / inkling_conv_acc() of one token for each of `rows` rows, row t with its own state states[t]
+/// (a host array of rows pointers), without taps.
+void inkling_conv_seqs(const float* x, float* const* states, const float* w, float* out, int channels, int rows,
+                       void* stream);
+void inkling_conv_acc_seqs(const float* x, float* const* states, const float* w, float* acc, int channels, int rows,
+                           void* stream);
 
 // ---- experts' activation -------------------------------------------------------------------------------------
 

@@ -94,15 +94,28 @@ struct ClipJobs {
     int first[5];   // the jobs' first groups, and the end
 };
 
-__global__ void clip_many_kernel(ClipJobs c, int count, long long pos) {
+// Where a call's tokens are: one sequence's, from a position on (inkling_clip_many()), or each row a sequence's of
+// its own at a position of its own (inkling_clip_many_seqs()).  pos(t) - t is handed to clip_group(), which adds t.
+struct ClipFrom {
+    long long pos;
+    __device__ long long first(int) const { return pos; }
+};
+struct ClipSeqs {
+    long long pos[kInklingSeqRows];
+    __device__ long long first(int t) const { return pos[t] - t; }
+};
+
+template <class From>
+__global__ void clip_many_kernel(ClipJobs c, int count, From from) {
     const int gi = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
         if (k >= count) return;
         if (gi < c.first[k + 1]) {
             const InklingClipJob& j = c.j[k];
-            clip_group(j.x, j.x_stride ? j.x_stride : j.heads * j.dim, j.scale, j.y, j.dim, j.heads,
-                       gi - c.first[k], j.threshold, j.tau.alpha, j.tau.floor, pos);
+            const int g = gi - c.first[k];
+            clip_group(j.x, j.x_stride ? j.x_stride : j.heads * j.dim, j.scale, j.y, j.dim, j.heads, g, j.threshold,
+                       j.tau.alpha, j.tau.floor, from.first(g / j.heads));
             return;
         }
     }
@@ -279,12 +292,35 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
     }
 }
 
+// The split path's rows: a call's tokens one after the other in one sequence (inkling_attend()), or each row a
+// sequence's of its own with its own caches, position and splits (inkling_attend_seqs()).  AttnArgs::nslot is then
+// the most splits of a row, and what a token's partials are strided by.
+struct AttnRow {
+    const half* kc;
+    const half* vc;
+    Kvq8 kq, vq;
+    long long pos;
+    int split, nslot;
+};
+struct AttnOne {
+    __device__ AttnRow row(const AttnArgs& a, int t) const {
+        return {a.kc, a.vc, a.kq, a.vq, a.pos + t, a.split, a.nslot};
+    }
+};
+struct AttnSeqs {
+    AttnRow r[kInklingSeqRows];
+    __device__ AttnRow row(const AttnArgs&, int t) const { return r[t]; }
+};
+
 // The splits of a token's head merged, in the splits' order, with its sink.  A block a head of a token, a thread a
-// value dimension.
-__global__ void attn_join_kernel(const float* __restrict__ work, const float* __restrict__ sinks,
-                                 float* __restrict__ out, int nslot) {
+// value dimension.  A row of one split has its output from attn_dec_kernel.
+template <class Rows>
+__global__ void attn_join_kernel(AttnArgs a, Rows rows) {
     const int th = blockIdx.x, d = threadIdx.x;
-    const float* w = work + size_t(th) * nslot * (AT_DIM + 2);
+    const int nslot = rows.row(a, th / a.n_head).nslot;
+    if (nslot <= 1) return;
+    const float* sinks = a.sinks;
+    const float* w = a.work + size_t(th) * a.nslot * (AT_DIM + 2);
     float mx = sinks ? sinks[th] : -INFINITY;
     for (int s = 0; s < nslot; ++s) mx = fmaxf(mx, w[size_t(s) * (AT_DIM + 2)]);
     float denom = sinks ? expf(sinks[th] - mx) : 0.0f, sum = 0.0f;
@@ -295,7 +331,7 @@ __global__ void attn_join_kernel(const float* __restrict__ work, const float* __
         denom += ws[1] * f;
         sum += ws[2 + d] * f;
     }
-    out[size_t(th) * AT_DIM + d] = sum / denom;
+    a.out[size_t(th) * AT_DIM + d] = sum / denom;
 }
 
 // The split path's kernel: one token of one group, the keys of one split.  No tiles in shared memory and no
@@ -321,16 +357,18 @@ __device__ __forceinline__ void load4(const half* c, const Kvq8& q8, size_t i, f
     }
 }
 
-template <bool KQ8, bool VQ8>
-__global__ void __launch_bounds__(DEC_WARPS * WARP) attn_dec_kernel(AttnArgs a) {
+template <bool KQ8, bool VQ8, class Rows>
+__global__ void __launch_bounds__(DEC_WARPS * WARP) attn_dec_kernel(AttnArgs a, Rows rows) {
     __shared__ float sm_m[DEC_WARPS][AT_PER], sm_l[DEC_WARPS][AT_PER];
     __shared__ float sm_o[DEC_WARPS][AT_PER][AT_DIM];
     const int lane = threadIdx.x % WARP, warp = threadIdx.x / WARP;
     const int g = blockIdx.y, t = blockIdx.z, n_rel = a.rel.n_rel;
-    const int p = int(a.pos + t);
+    const AttnRow r = rows.row(a, t);
+    if ((int) blockIdx.x >= r.nslot) return;   // a row with fewer splits than the call's most
+    const int p = int(r.pos);
     const int lo = a.window > 0 && p >= a.window ? p - a.window + 1 : 0;
-    const int s = lo / a.split + blockIdx.x;
-    const int kb = max(lo, s * a.split), ke = min(p + 1, (s + 1) * a.split);
+    const int s = lo / r.split + blockIdx.x;
+    const int kb = max(lo, s * r.split), ke = min(p + 1, (s + 1) * r.split);
     float q[AT_PER][4], rr[AT_PER], m[AT_PER], l[AT_PER], acc[AT_PER][4];
 #pragma unroll
     for (int h = 0; h < AT_PER; ++h) {
@@ -352,8 +390,8 @@ __global__ void __launch_bounds__(DEC_WARPS * WARP) attn_dec_kernel(AttnArgs a) 
             const int row = a.ring > 0 ? kp % a.ring : kp;
             const size_t base = (size_t(row) * a.kv_heads + g) * AT_DIM + 4 * lane;
             if (live[c]) {
-                load4<KQ8>(a.kc, a.kq, base, kx[c]);
-                load4<VQ8>(a.vc, a.vq, base, vx[c]);
+                load4<KQ8>(r.kc, r.kq, base, kx[c]);
+                load4<VQ8>(r.vc, r.vq, base, vx[c]);
             } else {
 #pragma unroll
                 for (int i = 0; i < 4; ++i) kx[c][i] = vx[c][i] = 0.0f;
@@ -424,7 +462,7 @@ __global__ void __launch_bounds__(DEC_WARPS * WARP) attn_dec_kernel(AttnArgs a) 
             O += sm_o[w][h][d] * f;
         }
         const size_t th = size_t(t) * a.n_head + g * AT_PER + h;
-        if (a.nslot > 1) {
+        if (r.nslot > 1) {
             float* wp = a.work + (th * a.nslot + blockIdx.x) * (AT_DIM + 2);
             if (d == 0) wp[0] = M, wp[1] = L;
             wp[2 + d] = O;
@@ -464,6 +502,29 @@ int split_keys(long long room) {
     return (int) std::max<long long>(AT_MIN_SPLIT, (s + AT_KEYS - 1) / AT_KEYS * AT_KEYS);
 }
 
+// The split path's keys a split and splits of a token whose positions + 1 are at most span_room.
+void splits_of(long long span_room, int window, int& split, int& nslot) {
+    // a window layer's tokens see `window` keys whatever the room: its splits are sized for those
+    split = split_keys(window > 0 ? std::min<long long>(span_room, window) : span_room);
+    long long n = (span_room + split - 1) / split;
+    if (window > 0) n = std::min<long long>(n, (window + split - 1) / split + 1);
+    nslot = (int) std::max<long long>(n, 1);
+}
+
+template <class Rows>
+void launch_dec(const AttnArgs& a, const Rows& rows, int ntok, bool kq, bool vq, cudaStream_t st) {
+    const dim3 gd((unsigned) a.nslot, a.kv_heads, ntok);
+    if (kq && vq) attn_dec_kernel<true, true, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
+    else if (kq) attn_dec_kernel<true, false, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
+    else if (vq) attn_dec_kernel<false, true, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
+    else attn_dec_kernel<false, false, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
+    check_launch("inkling_attend");
+    if (a.nslot > 1) {   // a row of one split: the block wrote the token's output itself
+        attn_join_kernel<Rows><<<ntok * a.n_head, AT_DIM, 0, st>>>(a, rows);
+        check_launch("inkling_attend (join)");
+    }
+}
+
 // ---- convolution -----------------------------------------------------------------------------------------------
 
 // The convolution of one token of one channel from its inputs s0 (oldest) .. s2 and v (the token's), in
@@ -484,17 +545,37 @@ __device__ __forceinline__ float conv_one(float s0, float s1, float s2, float v,
     return (v + y) * scale;
 }
 
-template <bool ACC>
-__global__ void conv_walk_kernel(const float* __restrict__ x, float* __restrict__ state, const float* __restrict__ w,
+// The convolution's scale: 1/3 with taps, 1/sqrt(5) without.
+inline float conv_scale(const float* taps) { return 1.0f / sqrtf(float((taps ? 2 : 1) * 4 + 1)); }
+
+// Where conv_walk_kernel's tokens are: the call's tokens one after the other in one sequence, with one state (a
+// thread walks them all), or each row a sequence's of its own with its own state (row blockIdx.y).
+struct ConvOne {
+    float* state;
+    int rows;
+    __device__ int first() const { return 0; }
+    __device__ int end() const { return rows; }
+    __device__ float* at(int) const { return state; }
+};
+struct ConvSeqs {
+    float* state[kInklingSeqRows];
+    __device__ int first() const { return blockIdx.y; }
+    __device__ int end() const { return blockIdx.y + 1; }
+    __device__ float* at(int t) const { return state[t]; }
+};
+
+template <bool ACC, class Rows>
+__global__ void conv_walk_kernel(const float* __restrict__ x, Rows rows, const float* __restrict__ w,
                                  const float* __restrict__ taps, int heads, float* __restrict__ out, int channels,
-                                 int rows, float scale) {
+                                 float scale) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const float* wc = w + 4 * size_t(c);
     const int h = taps ? c / (channels / heads) : 0;
-    float* st = state + size_t(c) * 3;
+    const int r0 = rows.first(), r1 = rows.end();
+    float* st = rows.at(r0) + size_t(c) * 3;
     float s0 = st[0], s1 = st[1], s2 = st[2];
-    for (int row = 0; row < rows; ++row) {
+    for (int row = r0; row < r1; ++row) {
         const size_t i = size_t(row) * channels + c;
         const float v = x[i];
         const float y = conv_one(s0, s1, s2, v, wc, taps ? taps + (size_t(row) * heads + h) * 4 : nullptr, scale);
@@ -867,18 +948,39 @@ struct KvArgs {
     long long pos;
 };
 
-__global__ void __launch_bounds__(AT_DIM) kv_store_kernel(KvArgs a) {
+// Where kv_store_kernel's tokens go: the call's tokens one after the other in one sequence (a block takes them all),
+// or each row a sequence's of its own (a block a row, blockIdx.z).
+struct KvOne {
+    __device__ int first(const KvArgs&) const { return 0; }
+    __device__ int end(const KvArgs& a) const { return a.rows; }
+    __device__ float* state(const KvArgs& a, int which, int) const { return a.state[which]; }
+    __device__ const InklingKvDst& dst(const KvArgs& a, int) const { return a.dst; }
+    __device__ long long pos(const KvArgs& a, int t) const { return a.pos + t; }
+};
+struct KvSeqs {
+    InklingKvSeq row[kInklingSeqRows];
+    __device__ int first(const KvArgs&) const { return blockIdx.z; }
+    __device__ int end(const KvArgs&) const { return blockIdx.z + 1; }
+    __device__ float* state(const KvArgs&, int which, int t) const { return which ? row[t].v_state : row[t].k_state; }
+    __device__ const InklingKvDst& dst(const KvArgs&, int t) const { return row[t].dst; }
+    __device__ long long pos(const KvArgs&, int t) const { return (long long) row[t].pos; }
+};
+
+template <class Rows>
+__global__ void __launch_bounds__(AT_DIM) kv_store_kernel(KvArgs a, Rows rows) {
     __shared__ float part[AT_DIM / WARP];
     const int g = blockIdx.x, which = blockIdx.y, d = threadIdx.x, lane = d % WARP;
     const int channels = a.kv_heads * AT_DIM, c = g * AT_DIM + d;
     const float* x = a.raw[which];
     const float* taps = a.taps[which];
     const float* wc = a.w[which] + 4 * size_t(c);
-    float* st = a.state[which] + size_t(c) * 3;
+    const int t0 = rows.first(a), t1 = rows.end(a);
+    float* st = rows.state(a, which, t0) + size_t(c) * 3;
     const float scale = 1.0f / sqrtf(float((taps ? 2 : 1) * 4 + 1));
-    const bool q8 = which ? a.dst.vc != nullptr : a.dst.kc != nullptr;
     float s0 = st[0], s1 = st[1], s2 = st[2];
-    for (int t = 0; t < a.rows; ++t) {
+    for (int t = t0; t < t1; ++t) {
+        const InklingKvDst& dst = rows.dst(a, t);
+        const bool q8 = which ? dst.vc != nullptr : dst.kc != nullptr;
         const float v = x[size_t(t) * channels + c];
         const float y = conv_one(s0, s1, s2, v, wc, taps ? taps + (size_t(t) * a.kv_heads + g) * 4 : nullptr, scale);
         s0 = s1, s1 = s2, s2 = v;
@@ -896,10 +998,10 @@ __global__ void __launch_bounds__(AT_DIM) kv_store_kernel(KvArgs a) {
             val = y * (1.0f / sqrtf(ss / float(AT_DIM) + a.eps));
         }
         if (a.out[which]) a.out[which][size_t(t) * channels + c] = val;
-        const long long p = a.pos + t;
-        const long long row = a.dst.ring > 0 ? p % a.dst.ring : p;
+        const long long p = rows.pos(a, t);
+        const long long row = dst.ring > 0 ? p % dst.ring : p;
         if (!q8) {
-            half* cache = reinterpret_cast<half*>(which ? a.dst.v : a.dst.k);
+            half* cache = reinterpret_cast<half*>(which ? dst.v : dst.k);
             cache[size_t(row) * channels + c] = __float2half(val);
         } else {
             // a warp is a Q8_0 block of 32 values: store_q8's rule
@@ -908,8 +1010,8 @@ __global__ void __launch_bounds__(AT_DIM) kv_store_kernel(KvArgs a) {
             for (int o = WARP / 2; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o, WARP));
             const float dl = amax / 127.0f;
             const float id = dl > 0.f ? 1.0f / dl : 0.0f;
-            int8_t* codes = which ? a.dst.vc : a.dst.kc;
-            half* scales = reinterpret_cast<half*>(which ? a.dst.vs : a.dst.ks);
+            int8_t* codes = which ? dst.vc : dst.kc;
+            half* scales = reinterpret_cast<half*>(which ? dst.vs : dst.ks);
             const size_t at = size_t(row) * channels + c;
             if (lane == 0) scales[at / 32] = __float2half(dl);
             const float q = fminf(fmaxf(rintf(val * id), -127.0f), 127.0f);
@@ -938,24 +1040,18 @@ size_t inkling_attend_work_floats(int n_head, int dim) {
     return size_t(kInklingSplitRows) * n_head * (kInklingMaxSplits + 2) * (dim + 2);
 }
 
-void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
-                    InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
-                    int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
-                    int64_t room) {
-    if (rows <= 0) return;
+namespace {
+// inkling_attend()'s and inkling_attend_seqs()'s checks, and the arguments every row shares
+AttnArgs attn_args(const char* who, const float* q, const InklingRel& rel, const float* sinks, int rows, float* out,
+                   int dim, int n_head, int kv_heads, float scale, int window, int ring, float* work) {
     if (dim != AT_DIM || kv_heads <= 0 || n_head != AT_PER * kv_heads)
-        throw std::invalid_argument("inkling_attend: heads of 128 values in groups of 3 only");
+        throw std::invalid_argument(std::string(who) + ": heads of 128 values in groups of 3 only");
     if (rel.n_rel < 0 || rel.n_rel > AT_MAX_REL || (rel.n_rel > 0 && !rel.r) || !rel.table)
-        throw std::invalid_argument("inkling_attend: bad relative-position bias");
+        throw std::invalid_argument(std::string(who) + ": bad relative-position bias");
     AttnArgs a{};
     a.q = q;
-    a.kc = (const half*) kcache;
-    a.vc = (const half*) vcache;
-    a.kq = kq8;
-    a.vq = vq8;
     a.rel = rel;
     a.sinks = sinks;
-    a.pos = (long long) pos;
     a.rows = rows;
     a.n_head = n_head;
     a.kv_heads = kv_heads;
@@ -964,31 +1060,32 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
     a.scale = scale;
     a.out = out;
     a.work = work;
+    return a;
+}
+}  // namespace
+
+void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
+                    InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
+                    int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
+                    int64_t room) {
+    if (rows <= 0) return;
+    AttnArgs a =
+        attn_args("inkling_attend", q, rel, sinks, rows, out, dim, n_head, kv_heads, scale, window, ring, work);
+    a.kc = (const half*) kcache;
+    a.vc = (const half*) vcache;
+    a.kq = kq8;
+    a.vq = vq8;
+    a.pos = (long long) pos;
     const bool kq = kq8.codes != nullptr, vq = vq8.codes != nullptr;
     const cudaStream_t st = cs(stream);
     // positions + 1, at most: the caller's room when it gives one, else pos + rows
     const long long span_room = room > 0 ? (long long) room : (long long) pos + rows;
 
     if (work && rows <= kInklingSplitRows && span_room > 0) {
-        // a window layer's tokens see `window` keys whatever the room: its splits are sized for those
-        const int split = split_keys(window > 0 ? std::min<long long>(span_room, window) : span_room);
-        long long nslot = (span_room + split - 1) / split;
-        if (window > 0) nslot = std::min<long long>(nslot, (window + split - 1) / split + 1);
-        nslot = std::max<long long>(nslot, 1);
-        const size_t need = size_t(rows) * n_head * nslot * (AT_DIM + 2);
+        splits_of(span_room, window, a.split, a.nslot);
+        const size_t need = size_t(rows) * n_head * a.nslot * (AT_DIM + 2);
         if (need <= work_floats) {
-            a.split = split;
-            a.nslot = (int) nslot;
-            const dim3 gd((unsigned) nslot, kv_heads, rows);
-            if (kq && vq) attn_dec_kernel<true, true><<<gd, DEC_WARPS * WARP, 0, st>>>(a);
-            else if (kq) attn_dec_kernel<true, false><<<gd, DEC_WARPS * WARP, 0, st>>>(a);
-            else if (vq) attn_dec_kernel<false, true><<<gd, DEC_WARPS * WARP, 0, st>>>(a);
-            else attn_dec_kernel<false, false><<<gd, DEC_WARPS * WARP, 0, st>>>(a);
-            check_launch("inkling_attend");
-            if (nslot > 1) {   // one split: the block wrote the token's output itself
-                attn_join_kernel<<<rows * n_head, AT_DIM, 0, st>>>(work, sinks, out, a.nslot);
-                check_launch("inkling_attend (join)");
-            }
+            launch_dec(a, AttnOne{}, rows, kq, vq, st);
             return;
         }
     }
@@ -1003,6 +1100,33 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
     check_launch("inkling_attend");
 }
 
+void inkling_attend_seqs(const float* q, const InklingAttnSeq* seqs, int rows, InklingRel rel, const float* sinks,
+                         float* out, int dim, int n_head, int kv_heads, float scale, int window, int ring,
+                         float* work, size_t work_floats, void* stream) {
+    if (rows <= 0) return;
+    if (rows > kInklingSeqRows || !work)
+        throw std::invalid_argument("inkling_attend_seqs: 1 to " + std::to_string(kInklingSeqRows) +
+                                    " rows, and work");
+    AttnArgs a = attn_args("inkling_attend_seqs", q, rel, sinks, rows, out, dim, n_head, kv_heads, scale, window, ring,
+                           work);
+    a.nslot = 1;
+    const bool kq = seqs[0].kq8.codes != nullptr, vq = seqs[0].vq8.codes != nullptr;
+    AttnSeqs r{};
+    for (int t = 0; t < rows; ++t) {
+        const InklingAttnSeq& c = seqs[t];
+        if ((c.kq8.codes != nullptr) != kq || (c.vq8.codes != nullptr) != vq)
+            throw std::invalid_argument("inkling_attend_seqs: every row's caches of one kind");
+        AttnRow& w = r.r[t];
+        w.kc = (const half*) c.kcache, w.vc = (const half*) c.vcache, w.kq = c.kq8, w.vq = c.vq8;
+        w.pos = (long long) c.pos;
+        splits_of(c.room > 0 ? (long long) c.room : w.pos + 1, window, w.split, w.nslot);
+        a.nslot = std::max(a.nslot, w.nslot);
+    }
+    if (size_t(rows) * n_head * a.nslot * (AT_DIM + 2) > work_floats)
+        throw std::invalid_argument("inkling_attend_seqs: work too small");
+    launch_dec(a, r, rows, kq, vq, cs(stream));
+}
+
 namespace {
 template <bool ACC>
 void conv_any(const float* x, float* state, const float* w, const float* taps, int heads, float* out, int channels,
@@ -1010,15 +1134,15 @@ void conv_any(const float* x, float* state, const float* w, const float* taps, i
     if (rows <= 0) return;
     if (taps && (heads <= 0 || channels % heads))
         throw std::invalid_argument("inkling_conv: channels must split evenly into the taps' heads");
-    const float scale = 1.0f / sqrtf(float((taps ? 2 : 1) * 4 + 1));
+    const float scale = conv_scale(taps);
     if (rows >= CONV_ROWS) {
         for (int r = 0; r < rows; r += 65535)   // a grid has at most 65535 rows
             conv_rows_kernel<ACC><<<dim3(grid(channels, 256), std::min(65535, rows - r)), 256, 0, cs(stream)>>>(
                 x, state, w, taps, heads, out, channels, r, scale);
         conv_state_kernel<<<grid(channels, 256), 256, 0, cs(stream)>>>(x, state, channels, rows);
     } else {
-        conv_walk_kernel<ACC><<<grid(channels, 256), 256, 0, cs(stream)>>>(x, state, w, taps, heads, out, channels,
-                                                                           rows, scale);
+        conv_walk_kernel<ACC><<<grid(channels, 256), 256, 0, cs(stream)>>>(x, ConvOne{state, rows}, w, taps, heads,
+                                                                           out, channels, scale);
     }
     check_launch("inkling_conv");
 }
@@ -1032,6 +1156,31 @@ void inkling_conv(const float* x, float* state, const float* w, const float* tap
 void inkling_conv_acc(const float* x, float* state, const float* w, const float* taps, int heads, float* acc,
                       int channels, int rows, void* stream) {
     conv_any<true>(x, state, w, taps, heads, acc, channels, rows, stream);
+}
+
+namespace {
+template <bool ACC>
+void conv_seqs(const float* x, float* const* states, const float* w, float* out, int channels, int rows,
+               void* stream) {
+    if (rows <= 0) return;
+    if (rows > kInklingSeqRows)
+        throw std::invalid_argument("inkling_conv_seqs: at most " + std::to_string(kInklingSeqRows) + " rows");
+    ConvSeqs s{};
+    for (int t = 0; t < rows; ++t) s.state[t] = states[t];
+    conv_walk_kernel<ACC><<<dim3(grid(channels, 256), rows), 256, 0, cs(stream)>>>(x, s, w, nullptr, 0, out, channels,
+                                                                                   conv_scale(nullptr));
+    check_launch("inkling_conv_seqs");
+}
+}  // namespace
+
+void inkling_conv_seqs(const float* x, float* const* states, const float* w, float* out, int channels, int rows,
+                       void* stream) {
+    conv_seqs<false>(x, states, w, out, channels, rows, stream);
+}
+
+void inkling_conv_acc_seqs(const float* x, float* const* states, const float* w, float* acc, int channels, int rows,
+                           void* stream) {
+    conv_seqs<true>(x, states, w, acc, channels, rows, stream);
 }
 
 void inkling_mix(const InklingMix& m, int n, int rows, float eps, void* stream) {
@@ -1120,7 +1269,9 @@ void inkling_gemv(const float* w, const float* x, float* y, int n_in, int n_out,
     check_launch("inkling_gemv");
 }
 
-void inkling_clip_many(const InklingClipJob* jobs, int count, int rows, int64_t pos, void* stream) {
+namespace {
+template <class From>
+void clip_many(const InklingClipJob* jobs, int count, int rows, const From& from, void* stream) {
     if (rows <= 0 || count <= 0) return;
     if (count > 4) throw std::invalid_argument("inkling_clip_many: at most 4 jobs");
     ClipJobs c{};
@@ -1131,8 +1282,21 @@ void inkling_clip_many(const InklingClipJob* jobs, int count, int rows, int64_t 
         c.first[k + 1] = c.first[k] + rows * jobs[k].heads;
     }
     const int per_block = 256 / WARP;
-    clip_many_kernel<<<grid(c.first[count], per_block), 256, 0, cs(stream)>>>(c, count, (long long) pos);
+    clip_many_kernel<From><<<grid(c.first[count], per_block), 256, 0, cs(stream)>>>(c, count, from);
     check_launch("inkling_clip_many");
+}
+}  // namespace
+
+void inkling_clip_many(const InklingClipJob* jobs, int count, int rows, int64_t pos, void* stream) {
+    clip_many(jobs, count, rows, ClipFrom{(long long) pos}, stream);
+}
+
+void inkling_clip_many_seqs(const InklingClipJob* jobs, int count, int rows, const int64_t* pos, void* stream) {
+    if (rows > kInklingSeqRows)
+        throw std::invalid_argument("inkling_clip_many_seqs: at most " + std::to_string(kInklingSeqRows) + " rows");
+    ClipSeqs from{};
+    for (int t = 0; t < rows; ++t) from.pos[t] = (long long) pos[t];
+    clip_many(jobs, count, rows, from, stream);
 }
 
 void inkling_kv_store(const float* kraw, const float* vraw, float* k_state, float* v_state, const float* k_w,
@@ -1174,8 +1338,27 @@ void inkling_kv_store(const float* kraw, const float* vraw, float* k_state, floa
     a.dst = dst;
     a.kv_heads = kv_heads, a.rows = rows, a.k_clip = k_clip, a.eps = eps;
     a.pos = (long long) pos;
-    kv_store_kernel<<<dim3(kv_heads, 2), AT_DIM, 0, cs(stream)>>>(a);
+    kv_store_kernel<<<dim3(kv_heads, 2), AT_DIM, 0, cs(stream)>>>(a, KvOne{});
     check_launch("inkling_kv_store");
+}
+
+void inkling_kv_store_seqs(const float* kraw, const float* vraw, const InklingKvSeq* seqs, const float* k_w,
+                           const float* v_w, const float* k_taps, const float* v_taps, int kv_heads, int dim,
+                           int rows, float k_clip, float eps, float* k_out, float* v_out, void* stream) {
+    if (rows <= 0) return;
+    if (dim != AT_DIM) throw std::invalid_argument("inkling_kv_store_seqs: heads of 128 values only");
+    if (rows > kInklingSeqRows)
+        throw std::invalid_argument("inkling_kv_store_seqs: at most " + std::to_string(kInklingSeqRows) + " rows");
+    KvArgs a{};
+    a.raw[0] = kraw, a.raw[1] = vraw;
+    a.w[0] = k_w, a.w[1] = v_w;
+    a.taps[0] = k_taps, a.taps[1] = v_taps;
+    a.out[0] = k_out, a.out[1] = v_out;
+    a.kv_heads = kv_heads, a.rows = rows, a.k_clip = k_clip, a.eps = eps;
+    KvSeqs r{};
+    for (int t = 0; t < rows; ++t) r.row[t] = seqs[t];
+    kv_store_kernel<<<dim3(kv_heads, 2, rows), AT_DIM, 0, cs(stream)>>>(a, r);
+    check_launch("inkling_kv_store_seqs");
 }
 
 }  // namespace strata::poly
