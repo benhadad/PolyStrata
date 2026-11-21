@@ -54,6 +54,7 @@ protected:
     void router_scores(const Layer& L, int n) override;
     void moe_shared(const Layer& L, int il, int n) override;
     void finish_logits(float* logits, int rows) override;
+    void shift_rows(ptrdiff_t by) override;
     size_t extra_bytes() const override;
     void save_layer(int il, int64_t pos, uint8_t* dst) override;
     void load_extra(const uint8_t* src, int64_t pos) override;
@@ -102,12 +103,16 @@ private:
     static constexpr int kMaxPasses = 8;
 
     float* stream(int k) const { return r_ + (size_t) k * n_embd_; }
+    /// Where a layer works on the stream of a call of n tokens: r_ itself for one, else res_ (gathered by the head,
+    /// scattered back by the tail).
+    float* work_stream(int n) const { return n == 1 ? stream(kCur) : res_; }
     void gather(int k, float* dst, int n, int first = 0);
     void scatter(int k, const float* src, int n);
     void copy_stream(int from, int to, int n);
     void attn(Block& B, int il, const float* xq, const float* xk, const float* xv, const void* const* q8, int n);
     int64_t attn_room(const Block& B, int n) const;
     void post_conv(const float* x, float* state, const Dev& w, float* acc, int n, bool fresh, const Row* rows);
+    void conv_snaps(const float* x, const float* state, int channels, int n);
     void dump(const char* name, int il, const float* dev, int width, int n);
     int slot_of(int v) const;   ///< llama.cpp's layer index of visit v (its cache slot), for the dumps
     template <class F>
@@ -129,7 +134,6 @@ private:
 
     // device scratch, rows_ tokens each
     float *res_ = nullptr;                 ///< the stream (kCur) from a layer's head to its tail
-    float* cres_ = nullptr;                ///< where the call's stream is worked on: res_, or r_ itself for one token
     const Row* tail_rows_ = nullptr;       ///< step()'s rows (rows_of_) from a layer's head to its tail
     float *blk_[4] = {};                   ///< the blocks, gathered from r_
     float *bank_ = nullptr, *bank_out_ = nullptr;
