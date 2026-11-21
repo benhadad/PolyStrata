@@ -32,7 +32,12 @@ namespace strata::poly {
 #if STRATA_LOWBIT_X86
 namespace {
 
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC has no _cvtsh_ss: the same F16C conversion through the vector intrinsic.
+inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h))); }
+#else
 LOWBIT_FN inline float h2f(uint16_t h) { return _cvtsh_ss(h); }
+#endif
 
 LOWBIT_FN inline float hsum_float_8(const __m256 x) {   // ggml's
     __m128 res = _mm256_extractf128_ps(x, 1);
