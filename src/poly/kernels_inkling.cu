@@ -11,6 +11,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::poly {
 namespace {
@@ -336,13 +337,19 @@ __global__ void attn_join_kernel(AttnArgs a, Rows rows) {
 
 // The split path's kernel: one token of one group, the keys of one split.  No tiles in shared memory and no
 // barriers while it walks: each warp takes DEC_KEYS keys at a time (the block's keys go to the warps in turn,
-// counted from the split's first key), a lane four of a key's values, so the keys' and values' reads of a step are
-// all on their way at once.  Each warp keeps its own running max, sum and output for the group's heads; the warps
-// are merged in their order at the end, and the block's result is the token's output when its call has one split,
-// else a partial for attn_join_kernel.  Nothing depends on the other tokens of the call.
-constexpr int DEC_WARPS = 4, DEC_KEYS = 4;
+// counted from the split's first key).  A key's score is the sum of 32 shares, a share four of its values' dot with
+// a head's query (values 4j .. 4j + 3) and bias weight j, added up pairwise as a butterfly over 32 lanes would (j
+// with j + 16, then 8 apart, 4, 2, 1).  A lane takes the four shares of one key that sum first (j, j + 8, j + 16,
+// j + 24), so the four keys' scores are made at once by 8 lanes each with three shuffles a head.  Its values: a
+// lane four of each key's, as the output is kept.  Each warp keeps its own running max, sum and output for the
+// group's heads; the warps are merged in their order at the end, and the block's result is the token's output when
+// its call has one split, else a partial for attn_join_kernel.  Nothing depends on the other tokens of the call.
+constexpr int DEC_WARPS = 4, DEC_KEYS = 4, DEC_LANES = WARP / DEC_KEYS;   // DEC_LANES: a key's lanes for its score
+constexpr int DEC_SHARES = WARP / DEC_LANES;                              // a lane's shares of a score
 static_assert(DEC_WARPS * WARP == AT_DIM, "attn_dec_kernel's merge takes a thread a value dimension");
+static_assert(AT_MAX_REL <= WARP, "a share has one bias weight at most");
 
+// Four values of a cache from value i: Q8_0 codes times their block's scale, or halves.
 template <bool Q8>
 __device__ __forceinline__ void load4(const half* c, const Kvq8& q8, size_t i, float* x) {
     if constexpr (Q8) {
@@ -358,10 +365,12 @@ __device__ __forceinline__ void load4(const half* c, const Kvq8& q8, size_t i, f
 }
 
 template <bool KQ8, bool VQ8, class Rows>
-__global__ void __launch_bounds__(DEC_WARPS * WARP) attn_dec_kernel(AttnArgs a, Rows rows) {
+__global__ void __launch_bounds__(DEC_WARPS * WARP, 5) attn_dec_kernel(AttnArgs a, Rows rows) {
     __shared__ float sm_m[DEC_WARPS][AT_PER], sm_l[DEC_WARPS][AT_PER];
     __shared__ float sm_o[DEC_WARPS][AT_PER][AT_DIM];
+    __shared__ __align__(16) float sm_q[AT_PER][AT_DIM];
     const int lane = threadIdx.x % WARP, warp = threadIdx.x / WARP;
+    const int sub = lane % DEC_LANES, mine = lane / DEC_LANES;   // the score's lanes: key `mine` of a step
     const int g = blockIdx.y, t = blockIdx.z, n_rel = a.rel.n_rel;
     const AttnRow r = rows.row(a, t);
     if ((int) blockIdx.x >= r.nslot) return;   // a row with fewer splits than the call's most
@@ -369,52 +378,98 @@ __global__ void __launch_bounds__(DEC_WARPS * WARP) attn_dec_kernel(AttnArgs a, 
     const int lo = a.window > 0 && p >= a.window ? p - a.window + 1 : 0;
     const int s = lo / r.split + blockIdx.x;
     const int kb = max(lo, s * r.split), ke = min(p + 1, (s + 1) * r.split);
-    float q[AT_PER][4], rr[AT_PER], m[AT_PER], l[AT_PER], acc[AT_PER][4];
+    // the queries in shared memory; share j = sub + DEC_LANES * k of each head's bias weight
+    float rr[AT_PER][DEC_SHARES], m[AT_PER], l[AT_PER], acc[AT_PER][4];
 #pragma unroll
     for (int h = 0; h < AT_PER; ++h) {
         const size_t th = size_t(t) * a.n_head + g * AT_PER + h;
-        const float4 v = *reinterpret_cast<const float4*>(a.q + th * AT_DIM + 4 * lane);
-        q[h][0] = v.x, q[h][1] = v.y, q[h][2] = v.z, q[h][3] = v.w;
-        rr[h] = lane < n_rel ? a.rel.r[th * n_rel + lane] : 0.0f;
+        sm_q[h][threadIdx.x] = a.q[th * AT_DIM + threadIdx.x];
+#pragma unroll
+        for (int k = 0; k < DEC_SHARES; ++k) {
+            const int j = sub + DEC_LANES * k;
+            rr[h][k] = j < n_rel ? a.rel.r[th * n_rel + j] : 0.0f;
+        }
         m[h] = -INFINITY, l[h] = 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; ++i) acc[h][i] = 0.0f;
     }
-    for (int k0 = kb + warp * DEC_KEYS; k0 < ke; k0 += DEC_WARPS * DEC_KEYS) {
-        float kx[DEC_KEYS][4], vx[DEC_KEYS][4], tb[DEC_KEYS];
+    // A step of the warp's DEC_KEYS keys from k0, at cache rows from row0.  A full step (its keys all live and not
+    // across a ring's end: all but a split's last) goes without those checks, and a far one (its keys all past the
+    // bias's extent: most of a long context) loads no bias weights (theirs are 0, as the general step finds).
+    const size_t key_stride = size_t(a.kv_heads) * AT_DIM;
+    auto step = [&](int k0, int row0, auto full, auto far) {
+        constexpr bool FULL = decltype(full)::value, FAR = decltype(far)::value;
+        size_t at[DEC_KEYS];   // each key's row
         bool live[DEC_KEYS];
 #pragma unroll
         for (int c = 0; c < DEC_KEYS; ++c) {
-            const int kp = k0 + c, dist = p - kp;
-            live[c] = kp < ke;
-            const int row = a.ring > 0 ? kp % a.ring : kp;
-            const size_t base = (size_t(row) * a.kv_heads + g) * AT_DIM + 4 * lane;
+            if constexpr (FULL) {
+                at[c] = (size_t(row0) * a.kv_heads + g) * AT_DIM + c * key_stride;
+                live[c] = true;
+            } else {
+                int row = row0 + c;
+                if (a.ring > 0 && row >= a.ring) row -= a.ring;
+                at[c] = (size_t(row) * a.kv_heads + g) * AT_DIM;
+                live[c] = k0 + c < ke;
+            }
+        }
+        // the values: a lane four of each key
+        float vx[DEC_KEYS][4];
+#pragma unroll
+        for (int c = 0; c < DEC_KEYS; ++c) {
             if (live[c]) {
-                load4<KQ8>(r.kc, r.kq, base, kx[c]);
-                load4<VQ8>(r.vc, r.vq, base, vx[c]);
+                load4<VQ8>(r.vc, r.vq, at[c] + 4 * lane, vx[c]);
             } else {
 #pragma unroll
-                for (int i = 0; i < 4; ++i) kx[c][i] = vx[c][i] = 0.0f;
+                for (int i = 0; i < 4; ++i) vx[c][i] = 0.0f;
             }
-            tb[c] = live[c] && lane < n_rel && dist < a.rel.extent ? a.rel.table[size_t(dist) * n_rel + lane] : 0.0f;
+        }
+        // the score of key `mine`: this lane's four shares of it, as the butterfly's first two rounds add them
+        float sc[AT_PER];
+        {
+            const int kp = k0 + mine, dist = p - kp;
+            const bool here = FULL || kp < ke;
+            const bool near = !FAR && here && dist < a.rel.extent;
+            size_t base = at[0];
+#pragma unroll
+            for (int c = 1; c < DEC_KEYS; ++c)
+                if (mine == c) base = at[c];
+            float sh[AT_PER][DEC_SHARES];
+#pragma unroll
+            for (int k = 0; k < DEC_SHARES; ++k) {
+                const int j = sub + DEC_LANES * k;
+                float kx[4];
+                if (here) {
+                    load4<KQ8>(r.kc, r.kq, base + 4 * j, kx);
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) kx[i] = 0.0f;
+                }
+                const float tb = near && j < n_rel ? a.rel.table[size_t(dist) * n_rel + j] : 0.0f;
+#pragma unroll
+                for (int h = 0; h < AT_PER; ++h) {
+                    const float4 qv = *reinterpret_cast<const float4*>(&sm_q[h][4 * j]);
+                    float d = __fmul_rn(qv.y, kx[1]);   // (the first two products: the old kernel's contraction)
+                    d = __fmaf_rn(qv.x, kx[0], d);
+                    d = __fmaf_rn(qv.z, kx[2], d);
+                    d = __fmaf_rn(qv.w, kx[3], d);
+                    sh[h][k] = __fmaf_rn(d, a.scale, __fmul_rn(tb, rr[h][k]));
+                }
+            }
+#pragma unroll
+            for (int h = 0; h < AT_PER; ++h) {
+                // shares j and j + 16, j + 8 and j + 24, then those two
+                float v = __fadd_rn(__fadd_rn(sh[h][0], sh[h][2]), __fadd_rn(sh[h][1], sh[h][3]));
+#pragma unroll
+                for (int o = DEC_LANES / 2; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, o, WARP));
+                sc[h] = v;
+            }
         }
         float s[AT_PER][DEC_KEYS];
 #pragma unroll
         for (int h = 0; h < AT_PER; ++h)
 #pragma unroll
-            for (int c = 0; c < DEC_KEYS; ++c) {
-                float d = q[h][0] * kx[c][0];
-                d += q[h][1] * kx[c][1];
-                d += q[h][2] * kx[c][2];
-                d += q[h][3] * kx[c][3];
-                s[h][c] = d * a.scale + tb[c] * rr[h];
-            }
-#pragma unroll
-        for (int o = WARP / 2; o > 0; o >>= 1)
-#pragma unroll
-            for (int h = 0; h < AT_PER; ++h)
-#pragma unroll
-                for (int c = 0; c < DEC_KEYS; ++c) s[h][c] += __shfl_xor_sync(0xffffffffu, s[h][c], o, WARP);
+            for (int c = 0; c < DEC_KEYS; ++c) s[h][c] = __shfl_sync(0xffffffffu, sc[h], c * DEC_LANES, WARP);
 #pragma unroll
         for (int h = 0; h < AT_PER; ++h) {
             float mx = -INFINITY;
@@ -428,18 +483,30 @@ __global__ void __launch_bounds__(DEC_WARPS * WARP) attn_dec_kernel(AttnArgs a, 
 #pragma unroll
             for (int c = 0; c < DEC_KEYS; ++c) {
                 pc[c] = live[c] ? expf(s[h][c] - m_new) : 0.0f;
-                sum += pc[c];
+                sum = __fadd_rn(sum, pc[c]);
             }
             m[h] = m_new;
-            l[h] = l[h] * alpha + sum;
+            l[h] = __fmaf_rn(l[h], alpha, sum);
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                float y = acc[h][i] * alpha;
+                float y = __fmaf_rn(acc[h][i], alpha, __fmul_rn(pc[0], vx[0][i]));
 #pragma unroll
-                for (int c = 0; c < DEC_KEYS; ++c) y += pc[c] * vx[c][i];
+                for (int c = 1; c < DEC_KEYS; ++c) y = __fmaf_rn(pc[c], vx[c][i], y);
                 acc[h][i] = y;
             }
         }
+    };
+    __syncthreads();   // the queries
+    // a ring's wraps are found by comparing, not dividing, as the keys go on
+    int row0 = kb + warp * DEC_KEYS;
+    if (a.ring > 0) row0 %= a.ring;
+    for (int k0 = kb + warp * DEC_KEYS; k0 < ke; k0 += DEC_WARPS * DEC_KEYS) {
+        const bool full = k0 + DEC_KEYS <= ke && (a.ring <= 0 || row0 + DEC_KEYS <= a.ring);
+        if (full && p - (k0 + DEC_KEYS - 1) >= a.rel.extent) step(k0, row0, std::true_type{}, std::true_type{});
+        else if (full) step(k0, row0, std::true_type{}, std::false_type{});
+        else step(k0, row0, std::false_type{}, std::false_type{});
+        row0 += DEC_WARPS * DEC_KEYS;
+        if (a.ring > 0 && row0 >= a.ring) row0 %= a.ring;
     }
 #pragma unroll
     for (int h = 0; h < AT_PER; ++h) {
