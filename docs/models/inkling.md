@@ -179,6 +179,41 @@ the CPU and with the cache holding the same experts. 15 of the 16 runs were iden
 code, experts cached) the two caches never held the same experts (1,864 and 1,869 at load), and the answers first
 differ at a token the model rated about as likely as another (ln p1/p2 0.15).
 
+## Long contexts
+
+A written token's attention reads the whole cache of its 8 full-attention layers, about 17 KiB a token of context in
+q8_0, so past 100K it takes most of a token's time. With `--kv q8_0`, `STRATA_KV_INT8=1` (the name Kolibri's opt-in
+has) reads a full layer's cache by `__dp4a` once its room is 32K or more (from the 16,385th token), with the queries
+quantized to Q8_0 codes too (a 32-value block's delta its largest |value| / 127, about as llama.cpp's flash-attention
+kernels do for a quantized cache). Window layers, shorter contexts, the prompt and fp16 caches are left as they are:
+there the default kernel was as fast or faster. Unlike Kolibri's, it does not touch the prompt. It is off by default:
+it changes the arithmetic, so answers can part from the default's at near-ties.
+
+> RTX 2070 Super 8 GB (448 GB/s). One token's attention of one full layer, q8_0 cache (`poly_inkling_kernels_test
+> decode`); and UD-Q2_K_XL with `--kv q8_0`, a 128K context, one engine per prompt, 64 tokens written
+
+| | default | `STRATA_KV_INT8=1` |
+|---|---|---|
+| one layer, room 32K | 268 us | 245 us |
+| one layer, room 128K | 1.06 ms | 0.98 ms |
+| one layer, room 512K | 4.29 ms | 4.00 ms |
+| one layer, room 1M | 8.98 ms (254 GB/s) | 8.32 ms (274 GB/s) |
+| writing after a 32,768-token prompt | 39.5 tok/s | 40.9 tok/s |
+| writing after a 131,008-token prompt | 29.3 tok/s | 29.9 tok/s |
+
+On this card most of a token's time at 128K goes to the experts that do not fit in its VRAM, so the gain in writing
+speed is small.
+
+How far it moves the answers, measured on the same card with the experts held fixed at load
+(`STRATA_FREEZE_EXPERTS=1`, the same cache both ways), the default against `STRATA_KV_INT8=1`:
+- teacher-forced, a 19,500-token prompt then 64 fed tokens: KL 0.0026 a row on average (largest 0.012), the same
+  most likely token at 65 of 65 rows (IQ4_NL); 0.0091 (largest 0.20), 63 of 65 (UD-Q2_K_XL). After a
+  30,000-token prompt and 32 fed tokens: 0.0002 (largest 0.003) and 0.0004 (largest 0.008), 33 of 33 both.
+- greedy, 256 tokens written after the 19,500- and the 30,000-token prompts: all 256 the same, both files.
+- the checks against llama.cpp (below) are prompts of up to 1,500 tokens, where it does not apply; with it applied
+  to every layer and room (a build that did, for the test), they stayed in range: 31 or 32 of 32 steps, prompt
+  cosine 0.99938 to 0.99971.
+
 ## Images
 
 Setup asks whether you want pictures; the answer is no unless you say yes, so `--yes` installs text only.

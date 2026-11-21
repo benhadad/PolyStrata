@@ -18,6 +18,9 @@ Gemma 4 has its own two, in the same Q8_0 rule but its own layout: `--kv int8` a
 On `kolibri1`, `STRATA_KV_INT8=1` makes both the decode and the prompt read the q8_0 cache with the int8
 reader below (`attend_int8`) instead of the float q8 readers. It is experimental: the queries are quantized
 too, so the answers change slightly, and it is opt-in.
+On `inkling2`, `STRATA_KV_INT8=1` takes a decoded token's attention of a full layer with a room of 32K or more by
+`__dp4a` on the q8_0 cache, the queries quantized too; window layers, shorter rooms and the prompt keep the float
+readers ([Inkling 2 Mini: long contexts](models/inkling.md#long-contexts)). Opt-in as well.
 
 ## What the format is
 
