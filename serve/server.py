@@ -3446,7 +3446,10 @@ class Service:
         # the template leaves that to the program
         # A template that writes the marker alone (MiniCPM-V 4.7's, like Gemma 4's) has no token before it to tell
         # an image's marker from the same text in a message: the first ones are the images (prepare()).
+        # Inkling 2's template writes <|content_image|><|unused_200054|> in a block of its own, and llama.cpp's mtmd
+        # puts the rows in place of the second (its img_beg is <|content_image|>, it writes no end).
         self.image_marks = ("<|image|>", None, ("<|image>", "<image|>")) if self.call_format == "gemma" else \
+            ("<|unused_200054|>", "<|content_image|>", None) if self.call_format == "inkling" else \
             (IMAGE_PAD, VISION_START if VISION_START in getattr(self.template, "source", VISION_START) else None, None)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points

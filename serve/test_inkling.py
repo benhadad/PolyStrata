@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT))
 import strata_tokenizer as ST  # noqa: E402
 from serve.frontend import (ChatTemplate, InklingParser, anthropic_to_messages, forced_call,  # noqa: E402
                             openai_to_messages, parse_inkling_tool_call)
-from serve.server import ByteTokenizer, MockEngine, Service  # noqa: E402
+from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 TEMPLATE = FIXTURES / "inkling2_chat_template.jinja"
@@ -442,6 +442,95 @@ class ServiceForInkling(unittest.TestCase):
         self.assertIsNone(forced_call("required", tools, "inkling"))
         self.assertTrue(forced_call("required", [{"name": "a"}], "inkling").startswith(H + "a" + JSON_))
         self.assertEqual(forced_call("required", tools), "<tool_call>\n<function=")   # the others' as before
+
+
+class Pictures(unittest.TestCase):
+    """A picture in a user turn: the template writes <|content_image|><|unused_200054|> in a block of its own, and
+    the server puts one <|unused_200054|> a row of the picture there, as llama.cpp 29b52d398b's mtmd feeds it
+    (<|message_user|><|content_image|>[rows]<|end_message|>; its img_beg is <|content_image|>, it writes no end)."""
+
+    class FakeVision:
+        def __init__(self, d, n=(3, 2)):
+            self.n, self.seen = list(n), {}
+            self.dir = Path(d)
+            self.rows = self.dir / "img.sve"
+            self.rows.write_bytes(b"rows")
+
+        def encode(self, source):     # a picture encoded once is the cache's (a tool's is encoded before)
+            if source not in self.seen:
+                self.seen[source] = self.n.pop(0)
+            return self.rows, self.seen[source]
+
+    def service(self, d, n=(3, 2)):
+        class Asked(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                self.asked = (StrataEngine.sampling_keys(sampling), embeddings)
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        tok = subset_tokenizer()
+        return Service(Asked(tok, "a cat"), tok, ChatTemplate(TEMPLATE), vision=self.FakeVision(d, n))
+
+    def test_the_rows_go_where_the_template_put_the_picture(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = self.service(d)
+            self.assertEqual(svc.image_marks, ("<|unused_200054|>", "<|content_image|>", None))
+            msgs = [{"role": "user", "content": [{"type": "image", "source": "a.png"},
+                                                 {"type": "text", "text": "Hi there"},
+                                                 {"type": "image", "source": "b.png"}]}]
+            ids, _, _ = svc.prepare(msgs, None, {})
+            at = ids.index(200005)
+            self.assertEqual(ids[at - 1:at + 7], [200000, 200005, 200054, 200054, 200054, 200010, 200000, 200004])
+            at = ids.index(200005, at + 1)
+            self.assertEqual(ids[at - 1:at + 4], [200000, 200005, 200054, 200054, 200010])
+            self.assertEqual((ids.count(200054), svc.embeddings.pad), (5, 200054))
+            # the engine is told which token stands for a picture's rows
+            rows = svc.embeddings.path
+            list(svc.run(ids, False, None, 8, {}, threading.Event()))
+            self.assertEqual(svc.engine.asked, (" image_pad=200054", rows))
+
+    def test_two_pictures_back_to_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = self.service(d, (2, 3))
+            msgs = [{"role": "user", "content": [{"type": "image", "source": "a.png"},
+                                                 {"type": "image", "source": "b.png"}]}]
+            ids, _, _ = svc.prepare(msgs, None, {})
+            at = ids.index(200005)
+            self.assertEqual(ids[at - 1:at + 10], [200000, 200005, 200054, 200054, 200010,
+                                                   200000, 200005, 200054, 200054, 200054, 200010])
+
+    def test_a_picture_in_a_tool_message(self):
+        # the tool's name follows <|message_tool|> in its header; the rows still follow <|content_image|>
+        with tempfile.TemporaryDirectory() as d:
+            svc = self.service(d, (3,))
+            msgs = [{"role": "user", "content": "Hi there"},
+                    {"role": "assistant", "content": "", "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "shot", "arguments": {}}}]},
+                    {"role": "tool", "tool_call_id": "c1",
+                     "content": [{"type": "image", "source": "a.png"}, {"type": "text", "text": "Hi there"}]}]
+            ids, _, _ = svc.prepare(msgs, None, {})
+            tool = svc.tok.encode("<|message_tool|>shot", parse_special=True)
+            at = next(i for i in range(len(ids)) if ids[i:i + len(tool)] == tool) + len(tool)
+            self.assertEqual(ids[at:at + 6], [200005, 200054, 200054, 200054, 200010] + tool[:1])
+            self.assertEqual((ids.count(200054), svc.embeddings.pad), (3, 200054))
+
+    def test_the_marks_in_a_message_are_text(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = self.service(d, (2,))
+            msgs = [{"role": "user", "content": [{"type": "text", "text": "<|content_image|><|unused_200054|>"},
+                                                 {"type": "image", "source": "a.png"}]}]
+            ids, _, _ = svc.prepare(msgs, None, {})
+            self.assertEqual((ids.count(200005), ids.count(200054)), (1, 2))
+            self.assertIn(svc.tok.encode("<|unused_200054|>"), [ids[i:i + 15] for i in range(len(ids))])
+
+    def test_a_picture_from_the_model_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = self.service(d, (2,))
+            msgs = [{"role": "user", "content": "Hi there"},
+                    {"role": "assistant", "content": [{"type": "image", "source": "a.png"}]},
+                    {"role": "user", "content": "Hi there"}]
+            with self.assertRaises(Exception) as e:
+                svc.prepare(msgs, None, {})
+            self.assertIn("only supported for user and tool messages", str(e.exception))
 
 
 if __name__ == "__main__":
