@@ -3581,12 +3581,43 @@ __global__ void __launch_bounds__(128) mmvq_slots_kernel(S slots, size_t row_byt
     if (lane == 0) at.y[row] = s;
 }
 
+// mmvq_slots_kernel for MmvqSlots::lanes, the formats whose grid mmvq_multi_kernel stages in shared memory: the grid
+// staged once for a block of LANE_ROWS rows a warp, each row row_dot_multi's for one column, which is row_dot's
+// arithmetic in its order - the same bits.  STRATA_OLD_IQ_MMVQ and STRATA_IQ_STAGE_GRID=0 keep mmvq_slots_kernel.
+constexpr int LANE_ROWS = 8;
+template<int TY, typename S>
+__global__ void __launch_bounds__(128) mmvq_slots_staged_kernel(S slots, size_t row_bytes, int n_in, int n_out) {
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TY, true>::value);
+    const uint32_t* s_grid = stage_iq_grid<TY, true>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
+    const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
+    const int lane = threadIdx.x, nb = n_in / Fmt<TY>::qk;
+    const int off[1] = {0};
+    for (int r = 0; r < LANE_ROWS; ++r) {
+        const int row = (blockIdx.x * 4 + threadIdx.y) * LANE_ROWS + r;
+        if (row >= n_out) return;
+        float s[1];
+        row_dot_multi<TY, 1, true, true>((const uint8_t*) at.w + (size_t) row * row_bytes, (const block_q8_1*) at.x,
+                                         off, 1, nb, lane, s, s_grid);
+        if (lane == 0) at.y[row] = s[0];
+    }
+}
+
 template<typename S>
 void slots_of(int t, const S& slots, int count, int n_in, int n_out, void* stream) {
     const size_t rb = iq_row_bytes(t, n_in);
     const dim3 grid((unsigned) ((n_out + 3) / 4), (unsigned) count), block(32, 4);
+    const dim3 staged((unsigned) ((n_out + 4 * LANE_ROWS - 1) / (4 * LANE_ROWS)), (unsigned) count);
     switch (t) {
-#define STRATA_MMVQ(T) case T: mmvq_slots_kernel<T, S><<<grid, block, 0, (cudaStream_t) stream>>>(slots, rb, n_in, n_out); break;
+#define STRATA_MMVQ(T)                                                                                              \
+    case T:                                                                                                         \
+        if constexpr (kStageIqGrid<T>) {                                                                            \
+            if (slots.lanes && !g_old_kernels && g_stage_grid) {                                                    \
+                mmvq_slots_staged_kernel<T, S><<<staged, block, 0, (cudaStream_t) stream>>>(slots, rb, n_in, n_out); \
+                break;                                                                                              \
+            }                                                                                                       \
+        }                                                                                                           \
+        mmvq_slots_kernel<T, S><<<grid, block, 0, (cudaStream_t) stream>>>(slots, rb, n_in, n_out);                 \
+        break;
         STRATA_MMVQ_FMTS(STRATA_MMVQ)
 #undef STRATA_MMVQ
         default: std::fprintf(stderr, "iq_mmvq_slots: type %d is not supported\n", t); std::exit(1);

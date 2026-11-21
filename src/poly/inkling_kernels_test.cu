@@ -4,7 +4,8 @@
 // controller, SiTU, and the attention over fp16 and Q8_0 caches, full and sliding-window (a ring), split, unsplit
 // and on the tensor cores, with and without a room past the call, for 1, 7 and more than 1,024 tokens; the calls
 // for a token of each of several sequences (Engine::step()'s rows) against a call for each row alone, to the bit;
-// and a visit's projections in one launch (native_mmvq_jobs()) against each matrix alone, to the bit.
+// and a visit's projections in one launch (native_mmvq_jobs()) and the cached experts' launches a warp a row
+// (MmvqSlots::lanes) against each matrix alone, to the bit.
 //
 // usage: poly_inkling_kernels_test [bench | decode]   (exit 0: every check within its tolerance; 77: no usable card;
 //        bench: also time the attention and the decode shapes; decode: only the decode-shape timings)
@@ -695,11 +696,12 @@ void same_bits(const char* what, const float* a, const float* b, size_t n) {
     if (diff) ++failures;
 }
 
-// Random blocks of a format, n_in x n_out, on the card: random bytes with sane fp16 scales (d, and dmin where the
-// format has one) so that the products stay finite.
+// Random blocks of a format, n_in x n_out, on the card: random bytes with sane scales (fp16 d, and dmin where the
+// format has one; MXFP4's power of two; IQ1_M's d in the top nibbles of its scales) so that the products stay finite.
 void* random_weights(int type, int n_in, int n_out) {
     namespace k = strata::kernels;
-    const int sub = type == 8 || type == 20 ? 32 : type == 42 ? 64 : 256;   // values a block
+    const bool small = type == 2 || type == 6 || type == 8 || type == 20 || type == 39;
+    const int sub = small ? 32 : type == 42 ? 64 : 256;   // values a block
     const size_t blk = k::native_mmvq_weight_bytes(type, sub, 1);
     std::uniform_int_distribution<int> byte(0, 255);
     std::uniform_real_distribution<float> scale(1e-3f, 1e-2f);
@@ -708,9 +710,23 @@ void* random_weights(int type, int n_in, int n_out) {
     for (size_t b = 0; b < h.size() / blk; ++b) {
         const __half d = __float2half(scale(rng));
         uint8_t* p = h.data() + b * blk;
-        if (type == 14) std::memcpy(p + blk - 2, &d, 2);
-        else std::memcpy(p, &d, 2);
-        if (type == 12 || type == 13) std::memcpy(p + 2, &d, 2);
+        if (type == 39) {
+            p[0] = (uint8_t) (118 + byte(rng) % 5);   // 2^-10 to 2^-6
+        } else if (type == 29) {
+            uint16_t bits;
+            std::memcpy(&bits, &d, 2);
+            for (int i = 0; i < 4; ++i) {   // blk - 8: the four 16-bit scales
+                uint8_t& hi = p[blk - 8 + 2 * i + 1];
+                hi = (uint8_t) ((hi & 0x0f) | (((bits >> (4 * i)) & 0xf) << 4));
+            }
+        } else if (type == 10) {
+            std::memcpy(p + blk - 4, &d, 2), std::memcpy(p + blk - 2, &d, 2);   // d and dmin at the end
+        } else if (type == 11 || type == 14) {
+            std::memcpy(p + blk - 2, &d, 2);
+        } else {
+            std::memcpy(p, &d, 2);
+            if (type == 12 || type == 13) std::memcpy(p + 2, &d, 2);
+        }
     }
     return up(h);
 }
@@ -765,6 +781,57 @@ void test_mmvq_jobs(int type, const char* name, int n_in, int count, int rows) {
     for (int i = 0; i < count; ++i) cudaFree(w[i]);
     for (void* p : xq) cudaFree(p);
     cudaFree(ya), cudaFree(yb);
+    cudaStreamDestroy(st);
+}
+
+// The cached experts' launch a warp a row (MmvqSlots::lanes, MmvqIds::lanes) against each matrix alone
+// (native_mmvq()) and against the same launch without lanes, to the bit: an expert's gate and up (n_in -> n_out) of
+// `count` experts, each its own column.
+void test_slots_lanes(int type, const char* name, int n_in, int n_out, int count) {
+    namespace k = strata::kernels;
+    cudaStream_t st;
+    ck(cudaStreamCreate(&st), "stream");
+    std::vector<void*> w((size_t) count);
+    for (void*& p : w) p = random_weights(type, n_in, n_out);
+    void* xq = random_q8_1(n_in, count, st);
+    const size_t xr = k::native_q8_1_bytes(n_in), total = size_t(n_out) * count;
+    float *ya, *yb, *yc, *yd;
+    ck(cudaMalloc(&ya, total * sizeof(float)), "malloc");
+    ck(cudaMalloc(&yb, total * sizeof(float)), "malloc");
+    ck(cudaMalloc(&yc, total * sizeof(float)), "malloc");
+    ck(cudaMalloc(&yd, total * sizeof(float)), "malloc");
+    k::MmvqSlots slots{}, plain{};
+    slots.lanes = true;
+    for (int i = 0; i < count; ++i) {
+        const void* x = (const uint8_t*) xq + i * xr;
+        k::native_mmvq(type, w[(size_t) i], x, ya + size_t(i) * n_out, n_in, n_out, 1, st);
+        slots.w[i] = plain.w[i] = w[(size_t) i], slots.x[i] = plain.x[i] = x;
+        slots.y[i] = yb + size_t(i) * n_out, plain.y[i] = yd + size_t(i) * n_out;
+    }
+    // the same through the card's picks: expert i is table[ids[i]], the table backwards
+    std::vector<const void*> table(w.rbegin(), w.rend());
+    std::vector<int32_t> ids((size_t) count);
+    for (int i = 0; i < count; ++i) ids[(size_t) i] = count - 1 - i;
+    void* dtable;
+    ck(cudaMalloc(&dtable, table.size() * sizeof(void*)), "malloc");
+    ck(cudaMemcpy(dtable, table.data(), table.size() * sizeof(void*), cudaMemcpyHostToDevice), "table");
+    int32_t* dids = up(ids);
+    const k::MmvqIds picks{(const void* const*) dtable, dids, 0, xq, xr, 1, yc, size_t(n_out), true};
+    const std::string what = std::string("slots lanes ") + name + " " + std::to_string(n_in) + " -> " +
+                             std::to_string(n_out) + " x" + std::to_string(count);
+    if (!k::native_mmvq_slots(type, slots, count, n_in, n_out, st) ||
+        !k::native_mmvq_ids(type, picks, count, n_in, n_out, st) ||
+        !k::native_mmvq_slots(type, plain, count, n_in, n_out, st)) {
+        std::printf("%-58s not taken  FAIL\n", what.c_str());
+        ++failures;
+    } else {
+        same_bits(what.c_str(), ya, yb, total);
+        same_bits((what + ", picks").c_str(), ya, yc, total);
+        same_bits((what + ", without lanes").c_str(), yd, yb, total);
+    }
+    for (void* p : w) cudaFree(p);
+    cudaFree(xq), cudaFree(dtable), cudaFree(dids);
+    cudaFree(ya), cudaFree(yb), cudaFree(yc), cudaFree(yd);
     cudaStreamDestroy(st);
 }
 
@@ -1448,6 +1515,37 @@ int main(int argc, char** argv) {
         }
     }
     test_mmvq_jobs(8, "Q8_0", 2304, 2, 1);
+    // Inkling 2's experts: IQ4_NL and Q8_0 (IQ4_NL's file), Q2_0 (UD-Q2_K_XL's downs); a tail of rows
+    for (int count : {1, 8}) {
+        test_slots_lanes(20, "IQ4_NL", 2304, 2304, count);
+        test_slots_lanes(20, "IQ4_NL", 1152, 2304, count);
+        test_slots_lanes(8, "Q8_0", 2304, 2304, count);
+        test_slots_lanes(8, "Q8_0", 1152, 2304, count);
+        test_slots_lanes(42, "Q2_0", 1152, 2304, count);
+    }
+    test_slots_lanes(20, "IQ4_NL", 2304, 2301, 8);
+    test_slots_lanes(8, "Q8_0", 1152, 37, 3);
+    // UD-Q2_K_XL's gate and up, and IQ1_M: iq_kernels.cu's, the grid staged; 8 rows a warp and its tails
+    for (int count : {1, 8}) {
+        test_slots_lanes(19, "IQ1_S", 2304, 2304, count);
+        test_slots_lanes(16, "IQ2_XXS", 2304, 2304, count);
+        test_slots_lanes(17, "IQ2_XS", 2304, 2304, count);
+        test_slots_lanes(22, "IQ2_S", 2304, 2304, count);
+        test_slots_lanes(29, "IQ1_M", 2304, 2304, count);
+    }
+    test_slots_lanes(19, "IQ1_S", 2304, 2301, 8);
+    test_slots_lanes(29, "IQ1_M", 1024, 37, 3);
+    test_slots_lanes(22, "IQ2_S", 1024, 37, 3);
+    // the other formats of native_mmvq.cu's lanes kernel
+    test_slots_lanes(2, "Q4_0", 2304, 1152, 3);
+    test_slots_lanes(6, "Q5_0", 1152, 37, 3);
+    test_slots_lanes(39, "MXFP4", 2880, 2880, 3);
+    test_slots_lanes(10, "Q2_K", 2304, 1152, 3);
+    test_slots_lanes(11, "Q3_K", 2304, 37, 3);
+    test_slots_lanes(12, "Q4_K", 2304, 1152, 3);
+    test_slots_lanes(13, "Q5_K", 1280, 512, 3);
+    test_slots_lanes(14, "Q6_K", 2304, 1152, 3);
+    test_slots_lanes(23, "IQ4_XS", 1536, 2301, 8);
     if (bench) bench_attend(table, dtable), bench_decode(table, dtable);
     cudaFree(dtable);
 

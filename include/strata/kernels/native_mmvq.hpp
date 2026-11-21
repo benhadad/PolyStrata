@@ -146,6 +146,13 @@ struct MmvqSlots {
     const void* w[kMmvqSlotsMax];
     const void* x[kMmvqSlotsMax];
     float* y[kMmvqSlotsMax];
+    // The same bits through other kernels: native_mmvq.cu's formats a warp a row instead of a block of WARPS warps
+    // (lane l with the terms of the block's threads l, 32 + l, ..., added in the block's order), where the block's
+    // threads had uneven work; the IQ formats whose grid iq_kernels.cu stages in shared memory (IQ1_S, IQ1_M, IQ2_XXS,
+    // IQ2_XS, IQ2_S), 8 rows a warp with the grid staged once.  The other IQ formats' launches are as without it.
+    // Faster for Inkling 2's experts on an RTX 2070 Super; measured on CUDA only.  It takes precedence over
+    // native_mmvq_slots_wide() (on by default on HIP); Metal takes no notice.
+    bool lanes = false;
 };
 bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream);
 // Whether the slots launches take a warp per row group where a row's blocks fit one warp (an expert's IQ4_XS down
@@ -166,6 +173,7 @@ struct MmvqIds {
     int x_every;
     float* y;
     std::size_t y_stride;
+    bool lanes = false;   // as MmvqSlots::lanes
 };
 bool native_mmvq_ids_supported(int ggml_type);
 bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);
