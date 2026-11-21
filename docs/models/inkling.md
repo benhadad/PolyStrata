@@ -44,8 +44,7 @@ options out for it. Its attention caches are fp16, or q8_0 with `--kv q8_0`, whi
 takes about 2.3 GiB of VRAM when it is full, in fp16 4.3 GiB. On an 8 GB card, use q8_0 for contexts past 32K. The file allows
 1,048,576 tokens and the engine sets no limit of its own, but the cache stays in VRAM (about 17 KiB a token in q8_0;
 the engine's KV streaming is not wired up for this model), and it was tried up to a 128K context, with prompts of up
-to 35K tokens. It reads text only for now. The repository has
-an image encoder too, which setup does not download. It has no draft model, so it writes one token at a time.
+to 35K tokens. Pictures are optional: see [Images](#images). It has no draft model, so it writes one token at a time.
 
 ## Install
 
@@ -72,6 +71,82 @@ an image encoder too, which setup does not download. It has no draft model, so i
 Setup takes IQ4_NL unless you name another size. UD-Q2_K_XL comes from Unsloth's repository in the architecture's
 native form (`inkling2`, the loop not unrolled); the engine reads that form as it is. Q8_0 was not run. ggml-org's model card gives the KL divergence against the BF16 file on
 wikitext-2: 0.0030 for Q8_0 and 0.0095 for IQ4_NL. PolyStrata did not measure that.
+
+## Images
+
+Setup asks whether you want pictures; the answer is no unless you say yes, so `--yes` installs text only.
+`--vision cpu` (or `gpu`, or `yes` for setup's choice by VRAM) adds them:
+
+```bash
+./setup.sh --family inkling --vision cpu
+```
+
+That downloads ggml-org's image encoder, `mmproj-Inkling-2-Mini-Q8_0.gguf` (0.35 GB), and compiles strata-vision
+from llama.cpp 29b52d398b, the commit that added the model and its encoder, into `engine-poly/vision-inkling/`. The
+other models' encoder (`engine-poly/strata-vision`, an older llama.cpp) is not changed. The encoder is llama.cpp's
+own (its `mtmd` library); PolyStrata places its rows where the template writes the picture
+(`<|content_image|>` and one `<|unused_200054|>` for each of the picture's rows after it, in a block of its own, as
+llama.cpp does) and does not norm them, as llama.cpp does not. A picture in a tool's message goes in the same way.
+
+A picture larger than the token limit (setup's 1,024 on the GPU, 300 on the CPU) is made smaller first, as
+llama.cpp does with the same limit. A picture costs its rows in the context: 640 x 640 pixels is 256 tokens.
+
+On an 8 GB card setup puts the encoder on the CPU. Measured on an RTX 2070 Super 8 GB with a Ryzen 5 3600XT
+(6 encoder threads), IQ4_NL, flash attention on in the encoder (its default):
+
+| | 256 rows (640 x 640) | 990 rows (1000 x 2000, at the 1,024 limit) | VRAM |
+| --- | ---: | ---: | ---: |
+| encoder on the CPU | 2.1 s | 12.3 s | none |
+| encoder on the GPU (`--vision gpu`) | 0.06 s | 0.31 s | 576 MiB after its warm-up |
+
+The photo below (208 rows) took 1.7 s on the CPU (setup's `--vision cpu` build, 6 threads) and 55 ms on the GPU.
+
+With the encoder on the GPU the engine held 908 routed experts in VRAM instead of 1,038. A prompt with a picture
+was read at the speed of a text prompt: 282 tokens with a 256-row picture in 1.2 to 1.35 s (209 to 239 tokens/s in
+5 server runs, the encoder on the CPU in 3 of them, on the GPU in 2), 323 tokens of text in 1.4 to 1.5 s (216 and 226
+tokens/s, 2 runs). A whole request (the encode, the prompt and an answer of 90 to 170 tokens) took 6.1 to 8.4 s with
+the encoder on the CPU and 3.7 to 6.0 s with it on the GPU.
+
+**UD-Q2_K_XL** reads pictures too (the same encoder; `--model UD-Q2_K_XL --vision gpu`). With the encoder on the GPU
+it read the 282-token prompt at 354 tokens/s and answered at 50 tokens/s; a whole request took 3.3 to 3.8 s.
+
+**How it was checked.** Against llama.cpp 29b52d398b's `mtmd` on the CPU, for 6 cases (7 drawn pictures from 1 to
+990 rows, two of them in one prompt) and a photo (llama.cpp's `tools/mtmd/test-1.jpeg`, a newspaper page, 640 x 488
+pixels, 208 rows), with the Q8_0 encoder and IQ4_NL unless named:
+
+- **Rows.** strata-vision's were bit-identical to llama.cpp's with flash attention off (the drawn pictures). With
+  flash attention on (the default) their cosine similarity was 0.98 or more, 0.999 on average (the photo: 0.970 or
+  more); with the encoder on the GPU 0.965 or more, 0.998 on average, and for the photo 0.957 or more, 0.999 on
+  average.
+- **Logits.** The engine, given llama.cpp's rows, against llama.cpp: cosine similarity of the prompt's logits 0.99986
+  or more, and greedy decoding chose the same token in all 33 positions (the prompt's and 32 steps) for every
+  case and the photo. With `--kv q8_0`: 32 of 33 for the 640 x 640 picture (the miss where llama.cpp's top two were
+  0.08 apart; a second run with the fp16 cache missed there too), 33 of 33 for the 990-row picture and the photo
+  (0.99980). With the photo split across calls (`--prompt-batch 64`): 0.99975, 33 of 33. With the rows normed like
+  a token's, as the engine did first, it was 0.98485 or more and 29 to 32 of 33. Rows from strata-vision with flash
+  attention on, from the GPU encoder, or from the BF16 encoder gave the same agreement (0.99989 or more, 33 of 33,
+  on 2 pictures).
+- **UD-Q2_K_XL.** The engine on Unsloth's file against llama.cpp on the same weights (converted to the form
+  llama.cpp loads, as for the text checks): the photo 0.99990 (33 of 33; `--kv q8_0` 0.99985, 33 of 33), the 640 x
+  640 picture 0.99993 (32 of 33, at step 11), the two pictures 0.99984 (33 of 33).
+- **Answers.** Asked "Describe the picture in one sentence." at temperature 0 about a 640 x 640 test picture, the
+  server and `llama-mtmd-cli` both answered: *A light blue background shows a red circle in the upper left, the word
+  "HELLO" in bold black letters across the middle, and a green square in the lower right.* Two server runs with the
+  encoder on the CPU gave that answer, one of them installed by setup with `--vision cpu`; two others and two with
+  it on the GPU worded the same picture a little differently. The engine's runs are not bit-for-bit repeatable, and
+  the reasoning before the answer has a near tie. About the photo, the `--vision cpu` install answered word for
+  word as `llama-mtmd-cli`: *A front page of The New York Times from July 20, 1969, with the bold headline "MEN WALK
+  ON MOON" and a black-and-white photo of the lunar surface and spacecraft.* The `--vision gpu` install read the
+  same headline, subhead and date and answered *A vintage New York Times front page from July 20, 1969, with the
+  bold headline "MEN WALK ON MOON" and a black-and-white photo of the lunar surface.* With UD-Q2_K_XL (encoder on
+  the GPU) the server and `llama-mtmd-cli` both answered *A vintage New York Times front page headlined "MEN WALK ON
+  MOON" with a black-and-white photo of the lunar surface and spacecraft.*; about the 640 x 640 picture both named
+  the red circle, "HELLO" and the green square, in other words.
+
+Why these settings: the Q8_0 encoder is half the BF16 one's download, uses 576 instead of 904 MiB of VRAM and is
+faster (256 rows: 2.1 against 3.3 s on the CPU), and the engine's logits were as close to llama.cpp's with either.
+Flash attention off made the encoder slower (256 rows 2.8 s, 990 rows 22.7 s on the CPU) and used 1,584 MiB of VRAM
+on the GPU, for no change in the logits that could be measured (on the drawn pictures).
 
 ## How it talks
 

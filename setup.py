@@ -198,6 +198,10 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # the Strata project's pin until it moves; only strata-vision builds from this one (a second checkout, like #14 suggests).
 VISION_LLAMA_CPP_COMMIT = "69f201a2051ea9b9e9b50c3cc56afd9e2ae64414"
 VISION_LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{VISION_LLAMA_CPP_COMMIT}.zip"
+# Inkling 2 Mini's image encoder (mtmd's inkling2v projector, and the inkling2 tokenizer strata-vision opens the text
+# file with) is newer than VISION_LLAMA_CPP_COMMIT: a third checkout, for that family's encoder only ("vision_llama"),
+# built into a folder of its own (build_vision_own), so the other families' encoder stays on its pin.
+INKLING_VISION_LLAMA_CPP_COMMIT = "29b52d398b294509746ec0a3f28948a3107c0213"
 
 # The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json, built
 # by tools/make_release.py.  Set this to the GitHub release download folder when publishing, e.g.
@@ -867,21 +871,31 @@ FAMILIES = {
                              (908724544, "39db176176a904b101f5173a4f03e785990f9279f94ab373c4fd629ae7011817")}},
     # Inkling 2 Mini (llama.cpp's inkling2_loop, ggml-org/llama.cpp 29b52d398b): Thinking Machines' looped mixture of
     # experts, 24 layers whose layers 6 to 17 run three times a token, 128 experts with 8 used.  ggml-org's GGUFs.
-    # Text only for now (the repository has an image encoder; it is not offered).  NVIDIA cards only ("cuda_only":
-    # the AMD build was not made for it), not run on Windows.  Its engine code takes one card ("one_card": no
-    # --layer-split yet) and one request at a time ("one_request": no --batch); its attention caches are fp16 or
-    # q8_0 (POLY_KV).  Measured on an RTX 2070 Super 8 GB with 62 GB of RAM (IQ4_NL): about 3.1 GiB of VRAM beside the
-    # experts at 8K in fp16, so "vram_beside_gb" 4.0 at 32K (the rows of the 8 full-attention passes: "row_bytes", 32 KiB a
-    # token in fp16, 17 KiB in q8_0; the 40 window passes' rings are fixed, ~0.3 GiB fp16, ~0.17 GiB q8_0); the engine's
-    # resident memory was 16.5 GiB.  "laptop_tps": 28 tokens/s after a 34.8K-token prompt, measured with q8_0 caches in a
-    # 128K context.  "arena_gb" is the files' expert tensors (IQ4_NL: layers 0-19 IQ4_NL, 20-23 Q8_0).  The
-    # experts the card does not hold stay in RAM, as for the others.  "sampling": the GGUF's general.sampling.*
-    # (temperature 1.0, top_k 50, top_p 1.0, min_p 0), written into a run config that has no sampling block of its own.
+    # Images are opt-in ("vision"; the question's default is no): ggml-org's Q8_0 mmproj, read by strata-vision built
+    # from llama.cpp 29b52d398b ("vision_llama", build_vision_own) into engine-poly/vision-inkling/, apart from the
+    # other families' encoder.  "vision_vram_gb": 576 MiB for the encoder's process after its warm-up at 1,024 tokens
+    # (RTX 2070 Super, flash attention on; 904 MiB with the BF16 mmproj, 1,584 MiB with flash attention off); the
+    # engine held 908 instead of 1,038 routed experts in VRAM beside it there.  Q8_0 rather than BF16: half the
+    # download, less VRAM, faster (256 rows: 2.1 s against 3.3 s on 6 CPU threads, 63 against 131 ms on the GPU), and
+    # the engine's prompt logits with either one's rows were as close to llama.cpp's (cosine 0.99989 or more, the same
+    # greedy tokens, 2 pictures).
+    # NVIDIA cards only ("cuda_only": the AMD build was not made for it), not run on Windows.  Its engine code takes
+    # one card ("one_card": no --layer-split yet) and one request at a time ("one_request": no --batch); its attention
+    # caches are fp16 or q8_0 (POLY_KV).  Measured on an RTX 2070 Super 8 GB with 62 GB of RAM (IQ4_NL): about 3.1 GiB
+    # of VRAM beside the experts at 8K in fp16, so "vram_beside_gb" 4.0 at 32K (the rows of the 8 full-attention passes:
+    # "row_bytes", 32 KiB a token in fp16, 17 KiB in q8_0; the 40 window passes' rings are fixed, ~0.3 GiB fp16, ~0.17
+    # GiB q8_0); the engine's resident memory was 16.5 GiB.  "laptop_tps": 28 tokens/s after a 34.8K-token prompt,
+    # measured with q8_0 caches in a 128K context.  "arena_gb" is the files' expert tensors (IQ4_NL: layers 0-19 IQ4_NL,
+    # 20-23 Q8_0).  The experts the card does not hold stay in RAM, as for the others.  "sampling": the GGUF's
+    # general.sampling.* (temperature 1.0, top_k 50, top_p 1.0, min_p 0), written into a run config that has no sampling
+    # block of its own.
     "inkling": {"title": "Inkling 2 Mini", "by": "Thinking Machines; GGUF by ggml-org",
                 "about": "on the strata-poly engine: one NVIDIA card, Linux; an 18 GB file, ~22 GB of RAM beside an "
-                         "8 GB card (16.5 GiB measured for the engine); a 2-bit and an 8-bit size too, no images",
+                         "8 GB card (16.5 GiB measured for the engine); a 2-bit and an 8-bit size too, images optional",
                 "hf": hf("ggml-org/Inkling-2-Mini-GGUF"), "file": "Inkling-2-Mini-{q}.gguf", "shards": 1,
-                "tag": "inkling2-", "name": "inkling-2-mini", "engine": "poly", "vision": False,
+                "tag": "inkling2-", "name": "inkling-2-mini", "engine": "poly", "vision": True,
+                "vision_llama": INKLING_VISION_LLAMA_CPP_COMMIT, "mmproj_hf": hf("ggml-org/Inkling-2-Mini-GGUF"),
+                "mmproj": "mmproj-Inkling-2-Mini-Q8_0.gguf", "vision_gb": 0.35, "vision_vram_gb": 0.6,
                 "experimental": True, "windows": False, "cuda_only": True, "ran_on_gb": 8, "row_bytes": 32768,
                 "laptop_tps": {32768: "28"}, "one_card": True, "one_request": True,
                 "windows_risk": "Inkling 2 Mini has not been built or run on Windows",
@@ -891,7 +905,8 @@ FAMILIES = {
                            "UD-Q2_K_XL": {"about": "Unsloth's 2-bit experts, higher where it matters: the fastest and "
                                                    "the least RAM (9 GB measured), a little less accurate",
                                           "download_gb": 9.1, "ram_gb": 14, "arena_gb": 8.4, "vram_beside_gb": 4.0,
-                                          "hf": hf("unsloth/Inkling-2-Mini-GGUF")},
+                                          "hf": hf("unsloth/Inkling-2-Mini-GGUF"),
+                                          "mmproj_hf": hf("ggml-org/Inkling-2-Mini-GGUF")},
                            "Q8_0": {"about": "8-bit throughout: the closest to the model as trained",
                                     "download_gb": 27.8, "ram_gb": 32, "arena_gb": 26.0, "vram_beside_gb": 4.0}},
                 "sha256": {"Inkling-2-Mini-IQ4_NL.gguf":
@@ -899,7 +914,9 @@ FAMILIES = {
                            "Inkling-2-Mini-UD-Q2_K_XL.gguf":
                            (9138715328, "20292e8142b69535ca88a5d04439d0fdeb4dc698d44c002dca706dcf92901441"),
                            "Inkling-2-Mini-Q8_0.gguf":
-                           (27820099264, "d57542f8aea5d7639beba5fc4ae7f584754916f63ac5d5a69328c27f652f45da")}},
+                           (27820099264, "d57542f8aea5d7639beba5fc4ae7f584754916f63ac5d5a69328c27f652f45da"),
+                           "mmproj-Inkling-2-Mini-Q8_0.gguf":
+                           (345910944, "233287272ec5ac39b4168677aba54a4c024f202410f5629fac1830e1059f8abb")}},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # Qwen3.6-35B-A3B (GGUF architecture qwen35moe), Unsloth's GGUFs with the MTP block: a family with an engine path of its
@@ -2673,17 +2690,23 @@ def check_shards(shards):
                  f"delete {s.name} and its .done mark and run setup again")
 
 
-def get_llama_cpp(vision=False):
+def get_llama_cpp(vision=False, commit: str | None = None):
     """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git.
-    `vision`: the image encoder's own newer checkout (VISION_LLAMA_CPP_COMMIT); the engines never use it."""
-    if vision and VISION_LLAMA_CPP_COMMIT == LLAMA_CPP_COMMIT:
-        vision = False
-    commit = VISION_LLAMA_CPP_COMMIT if vision else LLAMA_CPP_COMMIT
+    `vision`: the image encoder's own newer checkout (VISION_LLAMA_CPP_COMMIT); the engines never use it.
+    `commit`: that checkout instead, for a family's own encoder ("vision_llama", build_vision_own)."""
+    if commit is not None:
+        vision = commit != LLAMA_CPP_COMMIT
+        url = f"https://github.com/ggml-org/llama.cpp/archive/{commit}.zip" if vision else LLAMA_CPP_ZIP
+    else:
+        if vision and VISION_LLAMA_CPP_COMMIT == LLAMA_CPP_COMMIT:
+            vision = False
+        commit = VISION_LLAMA_CPP_COMMIT if vision else LLAMA_CPP_COMMIT
+        url = VISION_LLAMA_CPP_ZIP if vision else LLAMA_CPP_ZIP
     llama = ROOT / "third_party" / (f"llama.cpp-{commit[:7]}" if vision else "llama.cpp")
     if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
         return llama
     z = ROOT / "third_party" / f"llama.cpp-{commit[:7]}.zip"
-    download(VISION_LLAMA_CPP_ZIP if vision else LLAMA_CPP_ZIP, z, "llama.cpp source")
+    download(url, z, "llama.cpp source")
     tmp = ROOT / "third_party" / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
     try:
@@ -6745,6 +6768,63 @@ def build_engine_poly(gpu, yes, llama, vision="none", toolkit=13, portable=False
     return eng
 
 
+def vision_own_dir(family: str) -> Path:
+    """The folder of a family's own image encoder (a family with "vision_llama"): beside strata-poly, apart from the
+    encoder the other families share (engine-poly/strata-vision), with a BUILD.json of its own."""
+    return ROOT / ENGINE_POLY_DIR / f"vision-{family}"
+
+
+def vision_own_ok(family, cards, vision, toolkit=13, portable=False) -> bool:
+    """Whether the family's own encoder there is of this source, commit and portability, and on the device asked: one
+    built with CUDA (for these cards, with this toolkit) also runs on the CPU; one built without it, with any."""
+    out = vision_own_dir(family)
+    try:
+        meta = json.loads((out / "BUILD.json").read_text())
+    except (OSError, ValueError):
+        return False
+    was = meta.get("vision") or "none"
+    return (out / VEXE).exists() and meta.get("vision_src") == source_hash(VISION_SOURCES) and \
+        meta.get("llama") == FAMILIES[family]["vision_llama"] and bool(meta.get("portable")) == bool(portable) and \
+        (was == "gpu" and int(meta.get("toolkit", 13)) == toolkit and set(cards) <= set(meta.get("archs", [])) or
+         was == "cpu" and vision == "cpu")
+
+
+def build_vision_own(family, gpu, yes, vision, toolkit=13, portable=False) -> Path:
+    """Compile strata-vision from the family's own llama.cpp checkout (FAMILIES[family]["vision_llama"]) into
+    vision_own_dir(family) ("gpu": with CUDA, "cpu": without), and again when tools/vision or that commit changed, the
+    toolkit of a CUDA one is another, or the GPU is asked of a CPU one.  engine-poly/strata-vision and
+    engine-poly/BUILD.json are not touched.  Its BUILD.json has the toolkit's library folders ("cuda_dirs"), for the
+    config's lib_dirs.  Returns the folder."""
+    # build_engine_poly's encoder block, copied rather than shared: a change there would touch every family's encoder
+    commit = FAMILIES[family]["vision_llama"]
+    out = vision_own_dir(family)
+    cards = sorted({int(x) for x in gpu.get("archs", [gpu["arch"]])})
+    if vision_own_ok(family, cards, vision, toolkit, portable):
+        ok(f"{FAMILIES[family]['title']}'s image encoder already built")
+        return out
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = out / "BUILD.json"
+    vsrc = source_hash(VISION_SOURCES)
+    nvcc, vcvars = install_build_tools({**gpu, "archs": cards, "toolkit": toolkit,
+                                        "need_cuda": (12, 8) if max(cards) >= 120 else (12, 0)}, yes)
+    say(f"  Compiling {FAMILIES[family]['title']}'s image encoder (llama.cpp {commit[:7]})" +
+        (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
+    defs = [f"-DLLAMA_DIR={get_llama_cpp(commit=commit)}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}",
+            f"-DSTRATA_PORTABLE={'ON' if portable else 'OFF'}"]
+    if vision == "gpu":
+        defs += [f"-DCMAKE_CUDA_ARCHITECTURES={';'.join(str(x) for x in cards)}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
+    vdir = ROOT / (f"build-vision-{family}" + ("" if toolkit == 13 else "-cuda12"))
+    cmake_build(ROOT / "tools" / "vision", vdir, "strata-vision", defs, vcvars, f"build-vision-{family}.bat")
+    shutil.copy2(vdir / "bin" / VEXE, out / VEXE)
+    bindir = Path(nvcc).parent                            # the toolkit's own libraries, as build_engine_poly's
+    dirs = [str(x) for x in (bindir, bindir / "x64", bindir.parent / "lib64") if x.is_dir()] if vision == "gpu" else []
+    stamp.write_text(json.dumps({"source": "local", "llama": commit, "vision": vision, "vision_src": vsrc,
+                                 "archs": cards if vision == "gpu" else [], "toolkit": toolkit, "cuda_dirs": dirs,
+                                 **({"portable": True} if portable else {})}, indent=1))
+    ok(f"image encoder: {out / VEXE}")
+    return out
+
+
 def build_engine_poly_hip(gpu, llama, portable=False) -> Path:
     """Compile strata-poly for this AMD GPU into engine-poly/ (again only when its source changed: a `git pull`).
     Windows: AMD's TheRock Windows wheels in .rocm-win (build_engine_poly_hip_win; portable: see that function).
@@ -6883,9 +6963,11 @@ def update_poly_engine(cfg: dict, yes=False, cfg_path: Path | None = None) -> No
         if gpu is None:
             raise RuntimeError("no NVIDIA GPU found")
         gpu["archs"] = sorted({int(gpu_info(i)["arch"]) for i in picks})   # a layer split's cards
-        # the encoder too, when this model has one: on the device it was built for
+        # the encoder too, when this model has one: on the device it was built for.  A family's own encoder
+        # (build_vision_own) has its own stamp and is updated after this (update_vision_own), not the shared one.
         vis = cfg.get("vision")
-        vision = ("gpu" if meta.get("vision") == "gpu" or vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none"
+        vision = ("gpu" if meta.get("vision") == "gpu" or vis.get("gpu") else "cpu") \
+            if isinstance(vis, dict) and vision_own_family(cfg) is None else "none"
         changed = renamed
         fits = set(gpu["archs"]) <= {int(x) for x in meta.get("archs", [])}
         if not (meta.get("src") == source_hash(ENGINE_SOURCES) and (eng / POLY_EXE).exists() and fits
@@ -6907,6 +6989,44 @@ def update_poly_engine(cfg: dict, yes=False, cfg_path: Path | None = None) -> No
             ok(f"this install's engine is {POLY_EXE} now (it was {OLD_POLY_EXE}); {OLD_ENGINE_POLY_DIR}/ can be deleted")
     except (Exception, SystemExit) as e:
         warn(f"could not update strata-poly{'' if isinstance(e, SystemExit) else f' ({e})'}: starting the installed one")
+    finally:
+        update_vision_own(cfg, yes, cfg_path)
+
+
+def vision_own_family(cfg: dict) -> str | None:
+    """The family whose own image encoder (build_vision_own) this config's images use, or None."""
+    vis = cfg.get("vision")
+    return next((f for f in FAMILIES if FAMILIES[f].get("vision_llama") and isinstance(vis, dict) and
+                 Path(str(vis.get("exe", ""))).parent == vision_own_dir(f)), None)
+
+
+def update_vision_own(cfg: dict, yes=False, cfg_path: Path | None = None) -> None:
+    """Before a start, after the engine's update (update_poly_engine): a family's own image encoder is compiled again
+    when its stamp says so (build_vision_own), on the device and with the toolkit it was built for, and the config
+    gets its toolkit's library folders.  A failure must not stop the start: the installed one runs."""
+    own = vision_own_family(cfg)
+    if own is None:
+        return
+    try:
+        stamp = vision_own_dir(own) / "BUILD.json"
+        meta = json.loads(stamp.read_text()) if stamp.exists() else {}
+        g = cfg.get("gpu")
+        picks = g if isinstance(g, list) else [g if isinstance(g, int) else None]
+        gpu = gpu_info(picks[0])
+        if gpu is None:
+            raise RuntimeError("no NVIDIA GPU found")
+        gpu["archs"] = sorted({int(gpu_info(i)["arch"]) for i in picks})
+        want = "gpu" if meta.get("vision") == "gpu" or cfg["vision"].get("gpu") else "cpu"
+        build_vision_own(own, gpu, yes, want, int(meta.get("toolkit", config_toolkit(cfg))), bool(meta.get("portable")))
+        dirs = json.loads(stamp.read_text()).get("cuda_dirs") or []
+        new = [d for d in dirs if d not in (cfg.get("lib_dirs") or [])]
+        if new:
+            cfg["lib_dirs"] = (cfg.get("lib_dirs") or []) + new
+            if cfg_path is not None:
+                cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    except (Exception, SystemExit) as e:
+        warn(f"could not update the image encoder{'' if isinstance(e, SystemExit) else f' ({e})'}: starting the "
+             "installed one")
 
 
 def poly_tail_skip(cfg: dict, cfg_path: Path | None = None) -> None:
@@ -7165,9 +7285,15 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     prev_meta = json.loads(prev.read_text(encoding="utf-8")) if prev.exists() else {}
     portable = bool(WIN and (getattr(a, "max_compatibility", False) or
                              (not a.build and prev_meta.get("portable"))))
+    # a family with an encoder of its own ("vision_llama") builds it apart: the shared one is left as it is
+    own_vision = bool(fam.get("vision_llama")) and vision != "none"
     eng = build_engine_poly_hip(gpu, llama, portable) if hip else \
-        build_engine_poly(gpu, a.yes, llama, vision, cuda_tk, portable)
+        build_engine_poly(gpu, a.yes, llama, "none" if fam.get("vision_llama") else vision, cuda_tk, portable)
+    veng = build_vision_own(family, gpu, a.yes, vision, cuda_tk, portable) if own_vision else eng
     lib_dirs = engine_lib_dirs(eng)
+    if own_vision:                                     # the own encoder's toolkit libraries too (a CUDA one)
+        own_dirs = json.loads((veng / "BUILD.json").read_text()).get("cuda_dirs") or []
+        lib_dirs = lib_dirs + [d for d in own_dirs if d not in lib_dirs]
     ok(f"engine: {eng / POLY_EXE}")
 
     step(5, f"downloading {title} {model}")
@@ -7311,7 +7437,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         if vt > fam.get("vision_most", vt):
             warn(f"--vision-tokens {vt}: {title} reads a picture in one prompt batch, {fam['vision_most']} tokens "
                  "unless the engine is started with a larger --prompt-batch; a picture with more is refused")
-        cfg["vision"] = {"exe": str(eng / VEXE), "mmproj": str(mmproj), "model": str(gguf), "gpu": vision == "gpu",
+        cfg["vision"] = {"exe": str(veng / VEXE), "mmproj": str(mmproj), "model": str(gguf), "gpu": vision == "gpu",
                          "max_tokens": vt}
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
