@@ -2,13 +2,15 @@
 // the host in double precision, on random inputs of the model's shapes: the clips and tau, the short convolutions
 // (with and without the input-dependent taps, walked and parallel, and their state), the depth mix, the loop
 // controller, SiTU, and the attention over fp16 and Q8_0 caches, full and sliding-window (a ring), split, unsplit
-// and on the tensor cores, with and without a room past the call, for 1, 7 and more than 1,024 tokens; and the calls
-// for a token of each of several sequences (Engine::step()'s rows) against a call for each row alone, to the bit.
+// and on the tensor cores, with and without a room past the call, for 1, 7 and more than 1,024 tokens; the calls
+// for a token of each of several sequences (Engine::step()'s rows) against a call for each row alone, to the bit;
+// and a visit's projections in one launch (native_mmvq_jobs()) against each matrix alone, to the bit.
 //
 // usage: poly_inkling_kernels_test [bench | decode]   (exit 0: every check within its tolerance; 77: no usable card;
 //        bench: also time the attention and the decode shapes; decode: only the decode-shape timings)
 #include "strata/poly/inkling_kernels.hpp"
 #include "strata/poly/kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -693,6 +695,79 @@ void same_bits(const char* what, const float* a, const float* b, size_t n) {
     if (diff) ++failures;
 }
 
+// Random blocks of a format, n_in x n_out, on the card: random bytes with sane fp16 scales (d, and dmin where the
+// format has one) so that the products stay finite.
+void* random_weights(int type, int n_in, int n_out) {
+    namespace k = strata::kernels;
+    const int sub = type == 8 || type == 20 ? 32 : type == 42 ? 64 : 256;   // values a block
+    const size_t blk = k::native_mmvq_weight_bytes(type, sub, 1);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> scale(1e-3f, 1e-2f);
+    std::vector<uint8_t> h(k::native_mmvq_weight_bytes(type, n_in, n_out));
+    for (uint8_t& c : h) c = (uint8_t) byte(rng);
+    for (size_t b = 0; b < h.size() / blk; ++b) {
+        const __half d = __float2half(scale(rng));
+        uint8_t* p = h.data() + b * blk;
+        if (type == 14) std::memcpy(p + blk - 2, &d, 2);
+        else std::memcpy(p, &d, 2);
+        if (type == 12 || type == 13) std::memcpy(p + 2, &d, 2);
+    }
+    return up(h);
+}
+
+// n_in values of each of `rows` tokens in Q8_1 on the card
+void* random_q8_1(int n_in, int rows, cudaStream_t st) {
+    namespace k = strata::kernels;
+    float* x = up(randv(size_t(n_in) * rows, 1.f));
+    void* q;
+    ck(cudaMalloc(&q, k::native_q8_1_bytes(n_in, rows)), "malloc");
+    k::native_quantize_q8_1(x, q, n_in, rows, st);
+    ck(cudaStreamSynchronize(st), "quantize");
+    cudaFree(x);
+    return q;
+}
+
+// A visit's projections of its three inputs in one launch (native_mmvq_jobs(), Engine::lin_jobs()) against each
+// alone (native_mmvq()), to the bit: the first `count` of 8 matrices, 1 to 8 tokens.  Inkling 2's 2304 values a row
+// take a row a block; a row shorter than a block's threads take in one pass (512 values here) takes 2 rows a block,
+// the last of them a single row in a matrix of odd rows (37 and 31).
+void test_mmvq_jobs(int type, const char* name, int n_in, int count, int rows) {
+    namespace k = strata::kernels;
+    const int outs[8] = {3072, 3072, 384, 24, 1024, 37, 1024, 31};
+    void* w[8];
+    for (int i = 0; i < count; ++i) w[i] = random_weights(type, n_in, outs[i]);
+    cudaStream_t st;
+    ck(cudaStreamCreate(&st), "stream");
+    void* xq[3];
+    for (void*& q : xq) q = random_q8_1(n_in, rows, st);
+    size_t total = 0;
+    for (int i = 0; i < count; ++i) total += size_t(outs[i]) * rows;
+    float *ya, *yb;
+    ck(cudaMalloc(&ya, total * sizeof(float)), "malloc");
+    ck(cudaMalloc(&yb, total * sizeof(float)), "malloc");
+    k::MmvqJobs jobs{};
+    size_t at = 0;
+    for (int i = 0; i < count; ++i) {
+        const void* x = xq[i < 4 ? 0 : i % 2 ? 2 : 1];
+        k::native_mmvq(type, w[i], x, ya + at, n_in, outs[i], rows, st);
+        jobs.w[i] = w[i], jobs.x[i] = x, jobs.y[i] = yb + at, jobs.n_out[i] = outs[i];
+        at += size_t(outs[i]) * rows;
+    }
+    const bool took = k::native_mmvq_jobs(type, jobs, count, n_in, rows, st);
+    const std::string what = std::string("mmvq jobs ") + name + " " + std::to_string(n_in) + ", " +
+                             std::to_string(count) + " matrices, " + std::to_string(rows) + " rows";
+    if (!took) {
+        std::printf("%-58s not taken  FAIL\n", what.c_str());
+        ++failures;
+    } else {
+        same_bits(what.c_str(), ya, yb, total);
+    }
+    for (int i = 0; i < count; ++i) cudaFree(w[i]);
+    for (void* p : xq) cudaFree(p);
+    cudaFree(ya), cudaFree(yb);
+    cudaStreamDestroy(st);
+}
+
 void test_clip_many(int rows) {
     const InklingTau tau{0.1f, 8192};
     auto q = randv(size_t(rows) * 3072, 2.0f), r = randv(size_t(rows) * 384, 2.0f), qs = randv(3072, 0.3f, 1.f),
@@ -1358,6 +1433,21 @@ int main(int argc, char** argv) {
     for (int window : {0, 1024}) test_attend_seqs(9, false, window, table, dtable, kSeqPos, 8192, true);
     test_attend_seqs(2, true, 0, table, dtable, {131000, 70}, 131072);   // the largest split of a 128K context
     test_seqs_refuse_rows();
+    for (int rows : {1, 2, 4, 8}) {
+        test_mmvq_jobs(8, "Q8_0", 2304, 8, rows);
+        test_mmvq_jobs(12, "Q4_K", 2304, 8, rows);
+        test_mmvq_jobs(13, "Q5_K", 2304, 8, rows);
+        test_mmvq_jobs(14, "Q6_K", 2304, 8, rows);
+    }
+    for (int rows : {1, 3}) {   // 2 rows a block; fewer matrices
+        for (int count : {3, 8}) {
+            test_mmvq_jobs(8, "Q8_0", 512, count, rows);
+            test_mmvq_jobs(12, "Q4_K", 512, count, rows);
+            test_mmvq_jobs(13, "Q5_K", 512, count, rows);
+            test_mmvq_jobs(14, "Q6_K", 512, count, rows);
+        }
+    }
+    test_mmvq_jobs(8, "Q8_0", 2304, 2, 1);
     if (bench) bench_attend(table, dtable), bench_decode(table, dtable);
     cudaFree(dtable);
 

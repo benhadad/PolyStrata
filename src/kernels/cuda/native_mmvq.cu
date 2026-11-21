@@ -3265,6 +3265,131 @@ bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_i
     return true;
 }
 
+namespace {
+
+// native_mmvq_jobs: blockIdx.x counts the row blocks of all the matrices, matrix after matrix, and a block is
+// native_mmvq_multi_kernel's EXACT layout for its matrix (one row, or ROWS for a K too small for every thread).  A
+// kernel of its own rather than a matrix table in native_mmvq_multi_kernel, which every family's products run: that
+// kernel stays byte-identical.  An ordinary launch: it has no pdl_wait() for launch_pdl().
+struct JobsArgs {
+    MmvqJobs j;
+    int first[kMmvqJobsMax + 1];   // each matrix's first row block, and the end
+    int count;
+};
+
+template<typename F, int NCOLS, int ROWS>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_mmvq_jobs_kernel(JobsArgs a, int n_in) {
+    const int b = int(blockIdx.x);
+    int k = 0;
+#pragma unroll
+    for (int i = 1; i < kMmvqJobsMax; ++i)
+        if (i < a.count && b >= a.first[i]) k = i;
+    const auto* w = static_cast<const typename F::Block*>(a.j.w[k]);
+    const auto* x = static_cast<const Q81Block*>(a.j.x[k]);
+    float* y = a.j.y[k];
+    const int n_out = a.j.n_out[k];
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * (b - a.first[k]);
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    float tmp[NCOLS][ROWS] = {};
+    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+        const int kby = kbx * F::KBY;
+        const int kqs = F::kqs(tid);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const typename F::W wv = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][NCOLS][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < WARPS - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
+    }
+}
+
+template<typename F, int NCOLS>
+void launch_jobs_n(JobsArgs a, int n_in, cudaStream_t s) {
+    const auto go = [&](auto rows) {
+        constexpr int ROWS = decltype(rows)::value;
+        a.first[0] = 0;
+        for (int i = 0; i < a.count; ++i) a.first[i + 1] = a.first[i] + (a.j.n_out[i] + ROWS - 1) / ROWS;
+        native_mmvq_jobs_kernel<F, NCOLS, ROWS><<<unsigned(a.first[a.count]), dim3(WARP, WARPS), 0, s>>>(a, n_in);
+    };
+    if (n_in / F::DIV >= F::BPI) go(std::integral_constant<int, 1>{});
+    else go(std::integral_constant<int, 2>{});
+}
+
+template<typename F>
+void launch_jobs(const JobsArgs& a, int n_in, int ncols, cudaStream_t s) {
+    switch (ncols) {
+        case 1: launch_jobs_n<F, 1>(a, n_in, s); break;
+        case 2: launch_jobs_n<F, 2>(a, n_in, s); break;
+        case 3: launch_jobs_n<F, 3>(a, n_in, s); break;
+        case 4: launch_jobs_n<F, 4>(a, n_in, s); break;
+        case 5: launch_jobs_n<F, 5>(a, n_in, s); break;
+        case 6: launch_jobs_n<F, 6>(a, n_in, s); break;
+        case 7: launch_jobs_n<F, 7>(a, n_in, s); break;
+        default: launch_jobs_n<F, 8>(a, n_in, s); break;
+    }
+}
+
+}  // namespace
+
+bool native_mmvq_jobs(int ggml_type, const MmvqJobs& jobs, int count, int n_in, int ncols, void* stream) {
+#if defined(STRATA_HIP_GFX906)
+    (void) ggml_type, (void) jobs, (void) count, (void) n_in, (void) ncols, (void) stream;
+    return false;   // the wave layout's bits are other
+#else
+    // the formats whose single products are this layout's bits; several columns only in the exact layout
+    if (ggml_type != 8 && ggml_type != 12 && ggml_type != 13 && ggml_type != 14) return false;
+    if (ncols > 1 && (!g_multi_exact || g_b6_rows > 0 || s26_tsum_on())) return false;
+    if (count < 1 || count > kMmvqJobsMax || ncols < 1 || ncols > MAX_NCOLS)
+        throw std::invalid_argument("native_mmvq_jobs requires 1 to 8 matrices and 1 to 8 columns");
+    validate_shape(n_in, ncols, ggml_type == 8 ? 32 : 256);
+    validate_stream(stream);
+    JobsArgs a{};
+    a.j = jobs;
+    a.count = count;
+    for (int i = 0; i < count; ++i) {
+        if (jobs.n_out[i] <= 0) throw std::invalid_argument("native_mmvq_jobs requires n_out > 0");
+        validate_pointer(jobs.w[i]);
+        validate_pointer(jobs.x[i]);
+        validate_pointer(jobs.y[i]);
+        // a repacked matrix (STRATA_Q8_PACKED, STRATA_Q6_PACKED) goes through its own kernel
+        if (q8_packed_registry().count(jobs.w[i]) || q6_packed_registry().count(jobs.w[i])) return false;
+    }
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ggml_type) {
+    case 8: launch_jobs<SmallTraits<Q80Block, 8>>(a, n_in, ncols, s); break;
+    case 12: launch_jobs<Q4KTraits>(a, n_in, ncols, s); break;
+    case 13: launch_jobs<Q5KTraits>(a, n_in, ncols, s); break;
+    default: launch_jobs<Q6KTraits>(a, n_in, ncols, s); break;
+    }
+    launch_check();
+    return true;
+#endif
+}
+
 bool native_mmvq_ids_supported(int ggml_type) { return slots_kind(ggml_type) != 0; }
 
 bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream) {

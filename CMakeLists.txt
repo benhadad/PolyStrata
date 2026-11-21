@@ -2248,7 +2248,8 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
                                            src/poly/kernels.cu)
   target_include_directories(poly_inkling_kernels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                               ${_strata_gpu_include_directories})
-  target_link_libraries(poly_inkling_kernels_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  target_link_libraries(poly_inkling_kernels_test PRIVATE strata_kernels ${_strata_gpu_blas_target}
+                                                          ${_strata_gpu_runtime_target})
   add_test(NAME poly_inkling_kernels_test COMMAND poly_inkling_kernels_test)
   set_tests_properties(poly_inkling_kernels_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
   # cpu_lowbit.cpp's dot products against the dequantized rows, and with `bench` their speed from memory; needs no

@@ -84,4 +84,7 @@ namespace strata::kernels {
 // the 32-expert launches of STRATA_SLOTS_WARP: Metal's slots kernel takes 8 cached experts a launch
 bool native_mmvq_slots_wide() { return false; }
 
+// several matrices of one input a launch (Inkling 2's projections, which Metal does not run): lin() one by one
+bool native_mmvq_jobs(int, const MmvqJobs&, int, int, int, void*) { return false; }
+
 }  // namespace strata::kernels
