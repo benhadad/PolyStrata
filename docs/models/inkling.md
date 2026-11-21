@@ -47,6 +47,25 @@ the 302- and 1,500-token rows two runs each, old and new taken in turn, 256 toke
 Writing does not run on the tensor cores (a token at a time takes the split path); single runs differ by up to
 4.5% both ways, the means of two runs by at most 1.5%.
 
+A prompt's read copies the next layer's experts that the card does not hold while a layer runs, and hands the card
+each call's row tables by a kernel, so that they wait for no copy. Next to the build before it, 249b2de (2026-11-22,
+the same card; `strata-poly --serve` with the server's flags, a fresh copy of each expert profile, one engine a
+run, 1,042 of IQ4_NL's and 2,022 of UD-Q2_K_XL's experts cached, prompt only, two runs each, old and new in turn):
+
+| prompt | IQ4_NL | before | UD-Q2_K_XL | before |
+| --- | ---: | ---: | ---: | ---: |
+| 2,048 tokens | 787-789 tokens/s | 620-626 tokens/s | 929-931 tokens/s | 887-895 tokens/s |
+| 8,192 tokens | 947-948 tokens/s | 793-796 tokens/s | 888-896 tokens/s | 825 tokens/s |
+| 32,768 tokens | 911-914 tokens/s | 781-783 tokens/s | 852-854 tokens/s | 802-805 tokens/s |
+
+The results are the same. With `STRATA_FREEZE_EXPERTS=1`, the 20 most likely tokens and their probabilities at 4
+steps after prompts of 2,048 and 8,192 tokens (q8_0 caches) and of 2,048 tokens (fp16) matched 249b2de's for both
+models, in runs where both builds cached the same number of experts (that number depends on the VRAM free at load,
+and runs that differ in it differ in their results with either build). Through `--serve`, also frozen, at a 40K
+context with `--kv-whole` (so that a frozen 32K read has its rows), it gave the same tokens as the build before
+(f5e5a7e) after an 8,192-token prompt with a checkpoint inside its read, after that prompt resumed with 1,985
+tokens more, and after a 32,765-token prompt read in four reads that followed a read stopped at 3 s.
+
 IQ4_NL's speed depends on its expert profile (`--expert-profile`, which the server keeps up to date): it chooses the
 experts the card holds. On 100 questions (50 GSM8K, 50 MMLU-Pro, greedy, medium reasoning) IQ4_NL got 49 and 44
 right, UD-Q2_K_XL 48 and 41; the two gave the same answer to 92 of the 100.
