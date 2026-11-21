@@ -3595,6 +3595,40 @@ void Engine::lin(const Dev& w, const float* x, float* y, int n, const void* xq, 
     if (w.scale != 1.0f) axpy(y, w.scale, y, n * w.n_out, false, st_);
 }
 
+void Engine::lin_jobs(const LinJob* jobs, int count, int n) {
+    if (count > kernels::kMmvqJobsMax) throw std::logic_error("lin_jobs takes up to 8 matrices");
+    // lin() takes the float types, inputs not in Q8_1, and more than a launch's 8 tokens (a prompt batch: MMQ)
+    const auto alone = [&](const LinJob& j) {
+        return !j.xq || n > 8 || j.w->type == kTypeF32 || j.w->type == kTypeBF16;
+    };
+    // grouped: in a group already, launched or declined (then lin() takes it); done: launched
+    bool grouped[kernels::kMmvqJobsMax] = {}, done[kernels::kMmvqJobsMax] = {};
+    for (int i = 0; i < count; ++i) {
+        if (grouped[i] || alone(jobs[i])) continue;
+        kernels::MmvqJobs m{};
+        int idx[kernels::kMmvqJobsMax], k = 0;
+        for (int j = i; j < count; ++j) {
+            if (grouped[j] || alone(jobs[j]) || jobs[j].w->type != jobs[i].w->type ||
+                jobs[j].w->n_in != jobs[i].w->n_in)
+                continue;
+            m.w[k] = jobs[j].w->p;
+            m.x[k] = jobs[j].xq;
+            m.y[k] = jobs[j].y;
+            m.n_out[k] = jobs[j].w->n_out;
+            grouped[j] = true;
+            idx[k++] = j;
+        }
+        if (k < 2 || !kernels::native_mmvq_jobs((int) jobs[i].w->type, m, k, jobs[i].w->n_in, n, st_)) continue;
+        for (int j = 0; j < k; ++j) {
+            const LinJob& g = jobs[idx[j]];
+            if (g.w->scale != 1.0f) axpy(g.y, g.w->scale, g.y, n * g.w->n_out, false, st_);
+            done[idx[j]] = true;
+        }
+    }
+    for (int i = 0; i < count; ++i)
+        if (!done[i]) lin(*jobs[i].w, jobs[i].x, jobs[i].y, n, jobs[i].xq);
+}
+
 ExpertScales Engine::expert_scales(const Layer& L, const int32_t* ids) const {
     ExpertScales s;
     if (L.h_s_gate.empty() && L.h_s_up.empty()) return s;

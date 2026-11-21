@@ -433,16 +433,12 @@ void Inkling::conv_snaps(const float* x, const float* state, int channels, int n
 // The attention from its three normed inputs (and their Q8_1 copies) to ao_, through the output's convolution.
 void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const float* xv, const void* const* xq8, int n) {
     const int hk = n_kv_ * head_dim_, hq = n_head_ * head_dim_;
-    lin(B.wq, xq, q_, n, xq8[0]);
-    lin(B.wgate, xq, gate_, n, xq8[0]);
-    lin(B.wrel, xq, rel_, n, xq8[0]);
-    lin(B.wsink, xq, sink_, n, xq8[0]);
-    lin(B.wk, xk, kraw_, n, xq8[1]);
-    lin(B.wv, xv, vraw_, n, xq8[2]);
-    if (!B.swa) {
-        lin(B.k_conv_proj, xk, ktap_, n, xq8[1]);
-        lin(B.v_conv_proj, xv, vtap_, n, xq8[2]);
-    }
+    // the projections of the three inputs, those of one format in one launch
+    const LinJob proj[8] = {{&B.wq, xq, q_, xq8[0]},     {&B.wgate, xq, gate_, xq8[0]},
+                            {&B.wrel, xq, rel_, xq8[0]}, {&B.wsink, xq, sink_, xq8[0]},
+                            {&B.wk, xk, kraw_, xq8[1]},  {&B.wv, xv, vraw_, xq8[2]},
+                            {&B.k_conv_proj, xk, ktap_, xq8[1]}, {&B.v_conv_proj, xv, vtap_, xq8[2]}};
+    lin_jobs(proj, B.swa ? 6 : 8, n);
     const size_t v_at = (size_t) (n_conv_ - 1) * hk;   // the V convolution's state, after K's
     const InklingTau tau = B.swa ? InklingTau{} : InklingTau{tau_alpha_, tau_floor_};
     InklingClipJob jobs[2];

@@ -564,6 +564,15 @@ protected:
     bool input(int32_t token, int64_t row, float* dst) const;
     void lin(const Dev& w, const float* x, float* y, int n, const void* xq = nullptr, int rows_per_x = 0);
     void lin_raw(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x);
+    /// y = w x of several matrices for n tokens, each as lin(w, x, y, n, xq) gives it: those of one quantized format
+    /// and input width, with their inputs in Q8_1 (xq), in one launch (native_mmvq_jobs()) where it takes them.
+    struct LinJob {
+        const Dev* w;
+        const float* x;
+        float* y;
+        const void* xq;
+    };
+    void lin_jobs(const LinJob* jobs, int count, int n);
     /// The layer's ExpertScales for rows of the experts ids[r] (on the card), or none.
     ExpertScales expert_scales(const Layer& L, const int32_t* ids = nullptr) const;
     void fill_expert_cache();
