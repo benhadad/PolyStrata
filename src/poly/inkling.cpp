@@ -806,9 +806,7 @@ void Inkling::load_card_rows(const uint8_t* src, int64_t from, int64_t count, in
         if (B.swa || n == 0 || !B.plane[0]) continue;
         for (int i = 0; i < planes(); ++i) {
             const size_t row = plane_row(i);
-            ck(cudaMemcpy(B.plane[i] + (size_t) first * row, src + (size_t) (first - from) * row, (size_t) n * row,
-                          cudaMemcpyHostToDevice),
-               "load rows");
+            h2d(B.plane[i] + (size_t) first * row, src + (size_t) (first - from) * row, (size_t) n * row);
             src += (size_t) count * row;
         }
     }
@@ -854,8 +852,7 @@ void Inkling::load_extra(const uint8_t* src, int64_t pos) {
         for (int i = 0; i < planes(); ++i) {
             const size_t one_row = plane_row(i);
             window_runs(pos, [&](size_t slot, size_t at, size_t m) {
-                ck(cudaMemcpy(B.plane[i] + at * one_row, src + slot * one_row, m * one_row, cudaMemcpyHostToDevice),
-                   "load state");
+                h2d(B.plane[i] + at * one_row, src + slot * one_row, m * one_row);
             });
             src += (size_t) keep_ * one_row;
         }
