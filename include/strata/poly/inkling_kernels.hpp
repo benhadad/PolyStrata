@@ -148,6 +148,10 @@ inline constexpr int kInklingSplitRows = 16;   ///< calls of more tokens never s
 /// a call's keys go in at most this many splits (+1 for a window's offset)
 inline constexpr int kInklingMaxSplits = 64;
 size_t inkling_attend_work_floats(int n_head, int dim);
+/// calls of at least this many tokens take the tensor-core path on cards that have it (Turing or newer, CUDA): every
+/// call of more than kInklingSplitRows tokens (on an RTX 2070 Super, 17 tokens at position 8192 took 0.88 ms on the
+/// tensor cores against 5.2 ms unsplit in a full layer, 0.15 against 0.74 ms in a window layer)
+inline constexpr int kInklingMmaRows = kInklingSplitRows + 1;
 
 /// Inkling's attention for the `rows` tokens from position `pos`: token t (position p = pos + t) of head h attends
 /// the cached rows of positions max(0, p - window + 1) .. p (window 0: 0 .. p) with
@@ -160,7 +164,7 @@ size_t inkling_attend_work_floats(int n_head, int dim);
 /// hold window + rows - 1 rows (Flint's ring_ = window + rows_ does).
 /// dim must be 128 and n_head / kv_heads 3 (Inkling's 24 / 8); else std::invalid_argument.
 ///
-/// Two paths, the same math, float throughout (the caches' halves are the only rounding):
+/// Three paths, the same math; the first two float throughout (the caches' halves are the only rounding):
 ///  - split (rows <= kInklingSplitRows and work != null): the keys go in splits of S keys counted from position 0,
 ///    S = max(32, keys / kInklingMaxSplits rounded up to 32), keys = room (a window layer: min(room, window)),
 ///    one block a split, group and token (each of its warps four keys at a time, no shared-memory tiles), merged by
@@ -169,7 +173,12 @@ size_t inkling_attend_work_floats(int n_head, int dim);
 ///    positions + 1 a token of the call can have: the launch is sized for it (as attend()'s room); 0 means
 ///    pos + rows.  Calls given the same room split the same way.  q and the caches must be 16- and 8-byte aligned
 ///    (cudaMalloc'd rows of 128 values are).
-///  - unsplit: one block walks all the keys of a tile of up to 8 tokens (a prompt batch).
+///  - unsplit: one block walks all the keys of a tile of up to 8 tokens.
+///  - tensor cores (rows >= kInklingMmaRows, rel.n_rel 16, a CUDA card of Turing or newer; else unsplit): a prompt
+///    batch.  One block walks all the keys of 21 tokens of a group; the queries, R, the softmax's weights and the bias
+///    table's rows are rounded to halves, the caches' values too (a Q8_0 code times its scale), and the products sum
+///    floats (llama.cpp's flash attention rounds Q, P and V the same way); the bias stays a float.  A token's result
+///    does not depend on the tokens beside it in the call.
 /// Throws std::runtime_error on a launch error.
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,

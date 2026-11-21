@@ -1,6 +1,6 @@
 // src/poly/kernels_inkling.cu - Inkling 2 Mini's kernels; see include/strata/poly/inkling_kernels.hpp for the math
-// and where it comes from.  Plain float arithmetic throughout: the caches' halves (or Q8_0 codes) are the only
-// rounding.
+// and where it comes from.  Plain float arithmetic throughout, the caches' halves (or Q8_0 codes) the only rounding,
+// but for the prompt batches' attention on the tensor cores (attn_mma_kernel), whose products take halves.
 #include "strata/poly/inkling_kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -474,6 +474,240 @@ __global__ void __launch_bounds__(DEC_WARPS * WARP) attn_dec_kernel(AttnArgs a, 
             a.out[th * AT_DIM + d] = O * f / denom;
         }
     }
+}
+
+// ---- attention on the tensor cores (a prompt batch) -------------------------------------------------------------
+
+// The tensor cores' m16n8k16 step and ldmatrix (kernels.cu's): Turing runs the step as two of k = 8 on the same
+// registers.  AMD builds and cards before Turing have neither; there the host never launches attn_mma_kernel
+// (mma_attention()).
+#if defined(__HIPCC__) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750)
+#define INKLING_MMA 0
+#else
+#define INKLING_MMA 1
+#endif
+
+#if INKLING_MMA
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(b[0]));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[2]), "r"(a[3]), "r"(b[1]));
+#else
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t* r, const half* p, bool trans) {
+    const unsigned a = (unsigned) __cvta_generic_to_shared(p);
+    if (trans)
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+    else
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+__device__ __forceinline__ uint32_t half2_bits(float lo, float hi) {
+    const __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+#endif
+
+// attn_mma_kernel's shape: MMA_WARPS warps of 16 query rows, row r of the block token r / 3 and head r % 3 of the
+// group (MMA_TOKENS tokens; the last row of the last warp is unused), keys MMA_KEYS at a time.
+constexpr int MMA_WARPS = 4, MMA_KEYS = 32, MMA_TOKENS = 16 * MMA_WARPS / AT_PER;
+constexpr int MMA_KROW = AT_DIM + 8;                                // a key or value row in shared memory, halves
+constexpr int MMA_BIAS = MMA_KEYS + 8;                              // a warp's distances a tile (5 tokens + keys)
+constexpr int MMA_TROW = 16 + 8;                                    // a row of the bias table, halves
+constexpr int MMA_SLICE = 16 * (MMA_WARPS - 1) / AT_PER + MMA_BIAS;  // the block's distances a tile
+static_assert(16 * MMA_WARPS / AT_PER * AT_PER >= 16 * MMA_WARPS - 2, "attn_mma_kernel: at most 2 unused rows");
+
+// The unsplit path on the tensor cores, the way kernels.cu's attn_flash128_kernel goes: the queries (scaled to log2
+// units and rounded to halves) stay in registers, a tile's keys and values go to shared memory as halves (a Q8_0
+// cache's codes times their scales, rounded), S = Q K^T and O += P V are m16n8k16 steps that sum floats, and each
+// row keeps its online softmax in floats.  The relative-position bias is a product too: the warp's rows' R (16
+// values, rounded to halves) times the table's rows of the distances the tile spans (halves), a warp's 16 rows by
+// MMA_BIAS distances, put in shared memory as floats and read back at each score's distance.  Only the tiles
+// that hold a distance below the extent compute it.  The tiles are counted from position 0, so a row's sums do
+// not depend on the other rows of the block.  The sink is added at the end, as one more weight of no value.
+template <bool KQ8, bool VQ8>
+__global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) {
+#if INKLING_MMA
+    __shared__ __align__(16) half ks[MMA_KEYS][MMA_KROW], vs[MMA_KEYS][MMA_KROW];
+    __shared__ __align__(16) half slice[MMA_SLICE][MMA_TROW];
+    __shared__ __align__(16) float bias[MMA_WARPS][16][MMA_BIAS];
+    constexpr float LOG2E = 1.44269504f;
+    const int lane = threadIdx.x % WARP, w = threadIdx.x / WARP, gid = lane / 4, tig = lane % 4;
+    const int g = blockIdx.y, t0 = (gridDim.x - 1 - blockIdx.x) * MMA_TOKENS;   // the longest blocks first
+    const int nt = min(MMA_TOKENS, a.rows - t0), wt0 = 16 * w / AT_PER;
+    const long long p0 = a.pos + t0;
+    int tok[2], head[2];   // the thread's rows gid and gid + 8 of the warp's, as tokens of the block
+    bool row_ok[2];
+    for (int i = 0; i < 2; ++i) {
+        const int r = 16 * w + gid + 8 * i;
+        tok[i] = r / AT_PER;
+        head[i] = g * AT_PER + r % AT_PER;
+        row_ok[i] = tok[i] < nt;
+    }
+    uint32_t qa[8][4], ra[4];   // a block of 16 values a step, in log2 units; R the same
+    for (int i = 0; i < 2; ++i) {
+        const size_t th = (size_t(t0) + tok[i]) * a.n_head + head[i];
+        for (int u = 0; u < 2; ++u) {   // values 2 tig.. and 8 + 2 tig.. of each block of 16
+            for (int k = 0; k < 8; ++k) {
+                float2 x = make_float2(0.0f, 0.0f);
+                if (row_ok[i]) x = *reinterpret_cast<const float2*>(a.q + th * AT_DIM + 16 * k + 8 * u + 2 * tig);
+                qa[k][i + 2 * u] = half2_bits(x.x * a.scale * LOG2E, x.y * a.scale * LOG2E);
+            }
+            const float* rr = a.rel.r + th * 16 + 8 * u + 2 * tig;
+            ra[i + 2 * u] = row_ok[i] ? half2_bits(rr[0] * LOG2E, rr[1] * LOG2E) : 0u;
+        }
+    }
+    float o[16][4], m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+    for (int n = 0; n < 16; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    // the block's tokens attend positions [lo, hi): from the first one's window to the last one
+    const long long hi = p0 + nt, lo = a.window > 0 ? max(0LL, p0 - a.window + 1) : 0;
+    for (long long k0 = lo / MMA_KEYS * MMA_KEYS; k0 < hi; k0 += MMA_KEYS) {
+        __syncthreads();   // the last tile's keys, values and bias are read
+        // the tile's keys and values, 8 values a thread at a time; positions outside [lo, hi) are zeros (their
+        // cache rows may be anything), which no weight reads
+        for (int i = threadIdx.x; i < MMA_KEYS * AT_DIM / 8; i += MMA_WARPS * WARP) {
+            const int r = i / (AT_DIM / 8), c = 8 * (i % (AT_DIM / 8));
+            const long long key = k0 + r;
+            uint4 kx = make_uint4(0, 0, 0, 0), vx = kx;
+            if (key >= lo && key < hi) {
+                const size_t at = (size_t(a.ring > 0 ? key % a.ring : key) * a.kv_heads + g) * AT_DIM + c;
+                const auto load = [&](const half* f16, const Kvq8& q8, bool quant) {
+                    if (!quant) return *reinterpret_cast<const uint4*>(f16 + at);
+                    const uint2 codes = *reinterpret_cast<const uint2*>(q8.codes + at);
+                    const float d = __half2float(__ushort_as_half(q8.scales[at / 32]));
+                    uint32_t h[4];
+                    for (int j = 0; j < 4; ++j) {
+                        const uint32_t word = j < 2 ? codes.x : codes.y, sh = 16 * (j % 2);
+                        h[j] = half2_bits((float) (signed char) (word >> sh) * d,
+                                          (float) (signed char) (word >> (sh + 8)) * d);
+                    }
+                    return make_uint4(h[0], h[1], h[2], h[3]);
+                };
+                kx = load(a.kc, a.kq, KQ8);
+                vx = load(a.vc, a.vq, VQ8);
+            }
+            *reinterpret_cast<uint4*>(&ks[r][c]) = kx;
+            *reinterpret_cast<uint4*>(&vs[r][c]) = vx;
+        }
+        // the table's rows of the block's distances d = p0 - (k0 + MMA_KEYS - 1) + e, zeros past the extent and
+        // before 0 (the padded row, and keys after the token, which the mask removes)
+        const long long d0 = p0 - (k0 + MMA_KEYS - 1);
+        const bool near = d0 < a.rel.extent;
+        if (near)
+            for (int i = threadIdx.x; i < MMA_SLICE * 8; i += MMA_WARPS * WARP) {
+                const int e = i / 8, j = 2 * (i % 8);
+                const long long d = d0 + e;
+                float2 x = make_float2(0.0f, 0.0f);
+                if (d >= 0 && d < a.rel.extent) x = *reinterpret_cast<const float2*>(a.rel.table + d * 16 + j);
+                *reinterpret_cast<uint32_t*>(&slice[e][j]) = half2_bits(x.x, x.y);
+            }
+        __syncthreads();
+        float s[MMA_KEYS / 8][4];
+        for (int n = 0; n < MMA_KEYS / 8; ++n) {
+            s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+            for (int k = 0; k < 8; k += 2) {
+                uint32_t b[4];   // keys 8 n.., values 16 k.. and 16 (k + 1)..
+                ldmatrix_x4(b, &ks[8 * n + lane % 8][16 * k + 8 * (lane / 8)], false);
+                mma16816(s[n], qa[k], b);
+                mma16816(s[n], qa[k + 1], b + 2);
+            }
+        }
+        if (near) {
+            // the warp's rows times its distances: column e is distance p0 + wt0 - (k0 + MMA_KEYS - 1) + e
+            for (int n = 0; n < MMA_BIAS / 8; ++n) {
+                const half* tr = &slice[wt0 + 8 * n + gid][2 * tig];
+                const uint32_t b[2] = {*reinterpret_cast<const uint32_t*>(tr),
+                                       *reinterpret_cast<const uint32_t*>(tr + 8)};
+                float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                mma16816(c, ra, b);
+                *reinterpret_cast<float2*>(&bias[w][gid][8 * n + 2 * tig]) = make_float2(c[0], c[1]);
+                *reinterpret_cast<float2*>(&bias[w][gid + 8][8 * n + 2 * tig]) = make_float2(c[2], c[3]);
+            }
+            __syncwarp();
+        }
+        for (int i = 0; i < 2; ++i) {
+            const long long own = p0 + tok[i];   // the row's token attends positions (own - window, own]
+            const int e0 = tok[i] - wt0 + MMA_KEYS - 1;
+            float mx = -INFINITY;
+            for (int n = 0; n < MMA_KEYS / 8; ++n)
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    const int c = 8 * n + 2 * tig + j % 2;
+                    const long long key = k0 + c;
+                    if (!row_ok[i] || key > own || (a.window > 0 && key <= own - a.window))
+                        s[n][j] = -INFINITY;
+                    else if (near)
+                        s[n][j] += bias[w][gid + 8 * i][e0 - c];
+                    mx = fmaxf(mx, s[n][j]);
+                }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            const float now = fmaxf(m[i], mx), base = now == -INFINITY ? 0.0f : now;
+            const float f = exp2f(m[i] - base);
+            m[i] = now;
+            l[i] *= f;
+            for (int n = 0; n < 16; ++n) {
+                o[n][2 * i] *= f;
+                o[n][2 * i + 1] *= f;
+            }
+            for (int n = 0; n < MMA_KEYS / 8; ++n)
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    s[n][j] = exp2f(s[n][j] - base);
+                    l[i] += s[n][j];
+                }
+        }
+        for (int k = 0; k < MMA_KEYS / 16; ++k) {   // keys 16 k..: the weights as an A fragment
+            const uint32_t pa[4] = {half2_bits(s[2 * k][0], s[2 * k][1]), half2_bits(s[2 * k][2], s[2 * k][3]),
+                                    half2_bits(s[2 * k + 1][0], s[2 * k + 1][1]),
+                                    half2_bits(s[2 * k + 1][2], s[2 * k + 1][3])};
+            for (int n = 0; n < 16; n += 2) {
+                uint32_t b[4];   // keys 16 k.., values 8 n.. and 8 (n + 1)..
+                ldmatrix_x4(b, &vs[16 * k + lane % 8 + 8 * (lane / 8 % 2)][8 * n + 8 * (lane / 16)], true);
+                mma16816(o[n], pa, b);
+                mma16816(o[n + 1], pa, b + 2);
+            }
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+        if (!row_ok[i]) continue;
+        const size_t th = (size_t(t0) + tok[i]) * a.n_head + head[i];
+        float f = 1.0f;
+        if (a.sinks) {   // the sink, in log2 units like the scores
+            const float sink = a.sinks[th] * LOG2E, now = fmaxf(m[i], sink);
+            f = exp2f(m[i] - now);
+            l[i] = l[i] * f + exp2f(sink - now);
+        }
+        float* y = a.out + th * AT_DIM + 2 * tig;
+        for (int n = 0; n < 16; ++n)
+            *reinterpret_cast<float2*>(y + 8 * n) = make_float2(o[n][2 * i] * f / l[i], o[n][2 * i + 1] * f / l[i]);
+    }
+#else
+    (void) a;   // never launched without the tensor cores (mma_attention())
+#endif
+}
+
+// Whether attn_mma_kernel runs as such here: built for Turing or newer, and not from an older card's PTX compiled
+// for this one (whose instructions are that card's).
+bool mma_attention() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    cudaFuncAttributes fa{};
+    return cudaFuncGetAttributes(&fa, attn_mma_kernel<false, false>) == cudaSuccess && fa.ptxVersion >= 75;
+#endif
 }
 
 template <int TQ, bool KQ8, bool VQ8>
@@ -1088,6 +1322,15 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
             launch_dec(a, AttnOne{}, rows, kq, vq, st);
             return;
         }
+    }
+    if (rows >= kInklingMmaRows && rel.n_rel == 16 && mma_attention()) {
+        const dim3 gm(grid(rows, MMA_TOKENS), kv_heads);
+        if (kq && vq) attn_mma_kernel<true, true><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+        else if (kq) attn_mma_kernel<true, false><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+        else if (vq) attn_mma_kernel<false, true><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+        else attn_mma_kernel<false, false><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+        check_launch("inkling_attend");
+        return;
     }
     const int tq = rows >= 8 ? 8 : rows >= 4 ? 4 : rows >= 2 ? 2 : 1;
     const dim3 g(1, kv_heads, (rows + tq - 1) / tq);

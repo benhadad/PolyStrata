@@ -23,6 +23,25 @@ the same at 29 to 32 of 32 steps with llama.cpp's own answer fed in.
 | 1,500-token prompt | 452-455 tokens/s | 36.1-36.5 tokens/s | 586-611 tokens/s | 46.7-48.1 tokens/s |
 | 34,800-token prompt (IQ4_NL, through the server, an earlier day) | 232 tokens/s | 28.1 tokens/s | | |
 
+A prompt batch's attention runs on the tensor cores (cards of Turing or newer). Next to the build before it
+(2026-11-22, the same card; `strata-poly --serve`, a 128K context, q8_0 caches, one engine a run, each from a fresh
+copy of the model's expert profile, the prompt read in a fresh conversation; text from the parity prompts repeated;
+the 302- and 1,500-token rows two runs each, old and new taken in turn, 256 tokens written; the longer ones one run,
+64 tokens written):
+
+| run | prompt | before | writing | before |
+| --- | ---: | ---: | ---: | ---: |
+| 302 tokens, IQ4_NL | 282-290 tokens/s | 271-272 tokens/s | 38.8-40.0 tokens/s | 39.3-40.6 tokens/s |
+| 1,500 tokens, IQ4_NL | 521-523 tokens/s | 458-461 tokens/s | 38.5-38.7 tokens/s | 39.0-39.2 tokens/s |
+| 302 tokens, UD-Q2_K_XL | 557-561 tokens/s | 504-508 tokens/s | 51.1-52.3 tokens/s | 52.3-52.7 tokens/s |
+| 1,500 tokens, UD-Q2_K_XL | 881-888 tokens/s | 609-611 tokens/s | 49.0-49.5 tokens/s | 48.6-48.8 tokens/s |
+| 2,048 tokens, IQ4_NL | 658 tokens/s | 504 tokens/s | 34.0 tokens/s | 34.1 tokens/s |
+| 32,768 tokens, IQ4_NL | 820 tokens/s | 263 tokens/s | 28.7 tokens/s | 28.5 tokens/s |
+| 131,008 tokens, IQ4_NL | 659 tokens/s (199 s) | 92 tokens/s (1,421 s) | 20.6 tokens/s | 20.8 tokens/s |
+
+Writing does not run on the tensor cores (a token at a time takes the split path); single runs differ by up to
+4.5% both ways, the means of two runs by at most 1.5%.
+
 IQ4_NL's speed depends on its expert profile (`--expert-profile`, which the server keeps up to date): it chooses the
 experts the card holds. On 100 questions (50 GSM8K, 50 MMLU-Pro, greedy, medium reasoning) IQ4_NL got 49 and 44
 right, UD-Q2_K_XL 48 and 41; the two gave the same answer to 92 of the 100.
