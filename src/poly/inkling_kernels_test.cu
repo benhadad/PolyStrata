@@ -860,6 +860,35 @@ size_t bytes_differ(const void* a, const void* b, size_t bytes) {
     return diff;
 }
 
+// A window's snapshots (Engine::window()): each against the state inkling_conv() leaves after that many tokens.
+// Bits at or past rows, and past the kernel's 32 tokens, leave no snapshot: the places after the last stay as set.
+void test_conv_snaps(int rows, unsigned bits) {
+    const int channels = 1024, places = 33;
+    const size_t sn = size_t(channels) * 3, stride = sn + 64;   // a snapshot's place, apart as in the engine
+    auto x = randv(size_t(rows) * channels, 1.f), w = randv(size_t(channels) * 4, 0.4f), st = randv(sn, 1.f);
+    float *dx = up(x), *dw = up(w), *ds = up(st), *snap, *o;
+    ck(cudaMalloc(&snap, places * stride * 4), "malloc"), ck(cudaMalloc(&o, x.size() * 4), "malloc");
+    ck(cudaMemset(snap, 0xff, places * stride * 4), "memset");
+    inkling_conv_snaps(dx, ds, channels, rows, bits, snap, stride, nullptr);
+    const std::string name = "conv_snaps rows " + std::to_string(rows);
+    int k = 0;
+    for (int t = 0; t < rows && t < 32; ++t) {
+        if (!(bits >> t & 1u)) continue;
+        float* s1 = up(st);
+        inkling_conv(dx, s1, dw, nullptr, 0, o, channels, t + 1, nullptr);
+        same_bits((name + " after token " + std::to_string(t)).c_str(), s1, snap + size_t(k++) * stride, sn);
+        cudaFree(s1);
+    }
+    const size_t rest = (places - k) * stride * 4;
+    std::vector<uint8_t> unset(rest, 0xff);
+    uint8_t* du = up(unset);
+    const size_t diff = bytes_differ(du, snap + size_t(k) * stride, rest);
+    std::printf("%-58s %zu bytes written  %s\n", (name + " past its " + std::to_string(k) + " snapshots").c_str(),
+                diff, diff ? "FAIL" : "ok");
+    if (diff) ++failures;
+    cudaFree(du), cudaFree(dx), cudaFree(dw), cudaFree(ds), cudaFree(snap), cudaFree(o);
+}
+
 size_t caches_differ(const Cache& a, const Cache& b) {
     const size_t vals = size_t(a.rows_cap) * kKv * kDim;
     if (a.q8)
@@ -1311,6 +1340,12 @@ int main(int argc, char** argv) {
     for (int rows : {1, 4, 9, kInklingSeqRows}) test_clip_many_seqs(rows);
     for (bool acc : {false, true})
         for (int rows : {1, 9, kInklingSeqRows}) test_conv_seqs(acc, rows);
+    test_conv_snaps(4, 0x7u);
+    test_conv_snaps(8, 0x55u);
+    test_conv_snaps(2, 0x1u);
+    test_conv_snaps(4, 0xf0u);          // every bit past the rows
+    test_conv_snaps(3, 0xffffffffu);    // bits at and past the rows
+    test_conv_snaps(40, 0x80000005u);   // rows past 32: the last snapshot after token 31
     test_kv_store_seqs(1, false, true, 0);
     test_kv_store_seqs(9, false, true, 0);
     test_kv_store_seqs(9, true, true, 0);

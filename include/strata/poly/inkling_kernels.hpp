@@ -195,6 +195,12 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
 void inkling_conv(const float* x, float* state, const float* w, const float* taps, int heads, float* out,
                   int channels, int rows, void* stream);
 
+/// A window's snapshots of a convolution's state (Engine::window()): for the k-th token t of the call whose bit is
+/// set in `bits` (t < rows), the state as inkling_conv() leaves it after tokens 0 to t, into snap + k * stride
+/// (floats).  x and state as inkling_conv()'s, before the call advances the state.
+void inkling_conv_snaps(const float* x, const float* state, int channels, int rows, unsigned bits, float* snap,
+                        size_t stride, void* stream);
+
 // ---- depth mix -----------------------------------------------------------------------------------------------
 
 inline constexpr int kInklingMaxStates = 8;

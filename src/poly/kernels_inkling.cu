@@ -850,6 +850,26 @@ __global__ void conv_state_kernel(const float* __restrict__ x, float* __restrict
     st[2] = d;
 }
 
+// The state as it is after token t of x (t < rows) for each of the call's snapshot tokens (Snaps), row blockIdx.y
+// of them into snap + blockIdx.y * stride: what conv_state_kernel leaves after t + 1 tokens.  Before the call
+// advances the state.
+constexpr int SNAPS_MAX = 32;
+struct Snaps {
+    int t[SNAPS_MAX];
+};
+__global__ void conv_snaps_kernel(const float* __restrict__ x, const float* __restrict__ state, int channels,
+                                  Snaps snaps, float* __restrict__ snap, size_t stride) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const int t = snaps.t[blockIdx.y];
+    const float* st = state + size_t(c) * 3;
+    auto in = [&](int r) { return r >= 0 ? x[size_t(r) * channels + c] : st[3 + r]; };
+    float* to = snap + blockIdx.y * stride + size_t(c) * 3;
+    to[0] = in(t - 2);
+    to[1] = in(t - 1);
+    to[2] = in(t);
+}
+
 constexpr int CONV_ROWS = 16;
 
 // ---- mix -------------------------------------------------------------------------------------------------------
@@ -1399,6 +1419,17 @@ void inkling_conv(const float* x, float* state, const float* w, const float* tap
 void inkling_conv_acc(const float* x, float* state, const float* w, const float* taps, int heads, float* acc,
                       int channels, int rows, void* stream) {
     conv_any<true>(x, state, w, taps, heads, acc, channels, rows, stream);
+}
+
+void inkling_conv_snaps(const float* x, const float* state, int channels, int rows, unsigned bits, float* snap,
+                        size_t stride, void* stream) {
+    Snaps snaps{};
+    int n = 0;
+    for (int t = 0; t < rows && t < SNAPS_MAX; ++t)
+        if (bits >> t & 1u) snaps.t[n++] = t;
+    if (n == 0) return;
+    conv_snaps_kernel<<<dim3(grid(channels, 256), n), 256, 0, cs(stream)>>>(x, state, channels, snaps, snap, stride);
+    check_launch("inkling_conv_snaps");
 }
 
 namespace {
