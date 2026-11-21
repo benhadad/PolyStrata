@@ -147,6 +147,7 @@ private:
           *sink_ = nullptr, *gate_ = nullptr, *ktap_ = nullptr, *vtap_ = nullptr, *att_ = nullptr, *o_ = nullptr;
     float* awork_ = nullptr;
     size_t awork_n_ = 0;
+    bool int8_dot_ = false;   ///< STRATA_KV_INT8: decode attention by __dp4a on the q8_0 cache
     /// unsloth's layout: architecture "inkling2", block_count the visits, loop_{attn,k,v,mlp}_*
     bool unsloth_ = false;
     void* msg_mem_ = nullptr;              ///< that layout's message queries, a core layer's [2304, 4] each

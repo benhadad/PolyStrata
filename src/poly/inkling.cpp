@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -320,6 +321,13 @@ void Inkling::alloc_caches() {
     size_t one = 0;   // a position's bytes in a visit's planes together
     for (int i = 0; i < planes(); ++i) one += plane_row(i);
     if (q8()) std::fprintf(stderr, "strata-poly: q8_0 KV cache: %zu bytes a row\n", one / 2);
+    // STRATA_KV_INT8=1 reads the q8_0 cache of a decoded token with __dp4a, the queries quantized too (as Kolibri's
+    // does).  Opt-in: other arithmetic, so other bits; fp16 caches and prompt batches are unchanged.
+    if (const char* e = std::getenv("STRATA_KV_INT8"); e && std::atoi(e) != 0 && !int8_dot_) {
+        int8_dot_ = q8();
+        std::fprintf(stderr, "strata-poly: STRATA_KV_INT8: decode attention %s\n",
+                     int8_dot_ ? "through __dp4a on the q8_0 cache" : "unchanged (the cache is not q8_0)");
+    }
     size_t rings = 0;
     for (int v = 0; v < (int) blocks_.size(); ++v)
         if (runs(v) && blocks_[(size_t) v].swa) rings += (size_t) ring_ * one;
@@ -477,7 +485,7 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
                               B.swa ? nullptr : vtap_, n_kv_, head_dim_, n, qk_clip_, rms_eps_, k_, v_, st_);
         inkling_clip_many_seqs(jobs, 2, n, pos, st_);
         inkling_attend_seqs(q_, at, n, rel, sink_, att_, head_dim_, n_head_, n_kv_, scale, window, ring, awork_,
-                            awork_n_, st_);
+                            awork_n_, st_, int8_dot_);
     } else {
         conv_snaps(kraw_, B.conv, hk, n);
         conv_snaps(vraw_, B.conv + v_at, hk, n);
@@ -491,7 +499,7 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
         dump("Rcur", v, rel_, n_head_ * n_rel_, n);
         const InklingAttnSeq c = attn_seq(q8(), B.plane, pos_, attn_room(B, n));
         inkling_attend(q_, c.kcache, c.vcache, c.kq8, c.vq8, rel, sink_, pos_, n, att_, head_dim_, n_head_, n_kv_,
-                       scale, window, ring, awork_, awork_n_, st_, c.room);
+                       scale, window, ring, awork_, awork_n_, st_, c.room, int8_dot_);
     }
     dump("kqv_out", v, att_, hq, n);
     mul_sigmoid(att_, gate_, hq, n, hq, false, st_);

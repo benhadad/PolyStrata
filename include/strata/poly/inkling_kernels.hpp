@@ -173,6 +173,12 @@ inline constexpr int kInklingMmaRows = kInklingSplitRows + 1;
 ///    positions + 1 a token of the call can have: the launch is sized for it (as attend()'s room); 0 means
 ///    pos + rows.  Calls given the same room split the same way.  q and the caches must be 16- and 8-byte aligned
 ///    (cudaMalloc'd rows of 128 values are).
+///    With `int8_dot` (STRATA_KV_INT8), Q8_0 keys and values and a full layer (window 0), the rows whose splits are
+///    of 512 keys or more (a room of 32K or more) quantize the queries to Q8_0 codes as well (a 32-value block's
+///    delta its largest |value| / 127, about as llama.cpp's flash-attention kernels do for a quantized K) and take
+///    each score as __dp4a dots of the codes times the two deltas, a key 8 lanes with 16-byte loads of its codes
+///    (the caches must then be 16-byte aligned): other arithmetic, so other bits.  A row's kernel depends on its own
+///    split only.  fp16 caches, window layers, shorter rooms and the other paths ignore it.
 ///  - unsplit: one block walks all the keys of a tile of up to 8 tokens.
 ///  - tensor cores (rows >= kInklingMmaRows, rel.n_rel 16, a CUDA card of Turing or newer; else unsplit): a prompt
 ///    batch.  One block walks all the keys of 21 tokens of a group; the queries, R, the softmax's weights and the bias
@@ -183,7 +189,7 @@ inline constexpr int kInklingMmaRows = kInklingSplitRows + 1;
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
-                    int64_t room = 0);
+                    int64_t room = 0, bool int8_dot = false);
 
 // ---- short convolutions --------------------------------------------------------------------------------------
 
@@ -346,7 +352,7 @@ struct InklingAttnSeq {
 /// std::invalid_argument for more than kInklingSeqRows rows or caches of mixed kinds.
 void inkling_attend_seqs(const float* q, const InklingAttnSeq* seqs, int rows, InklingRel rel, const float* sinks,
                          float* out, int dim, int n_head, int kv_heads, float scale, int window, int ring,
-                         float* work, size_t work_floats, void* stream);
+                         float* work, size_t work_floats, void* stream, bool int8_dot = false);
 
 /// inkling_conv() / inkling_conv_acc() of one token for each of `rows` rows, row t with its own state states[t]
 /// (a host array of rows pointers), without taps.

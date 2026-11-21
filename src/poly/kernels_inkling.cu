@@ -2,6 +2,7 @@
 // and where it comes from.  Plain float arithmetic throughout, the caches' halves (or Q8_0 codes) the only rounding,
 // but for the prompt batches' attention on the tensor cores (attn_mma_kernel), whose products take halves.
 #include "strata/poly/inkling_kernels.hpp"
+#include "strata/kernels/dp4a.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -141,6 +142,7 @@ struct AttnArgs {
     float scale;
     int split;   // the split path's keys a split (counted from position 0)
     int nslot;   // the split path's splits a token's partials have room for
+    int i8_from;  // the split path's rows of splits of this many keys or more take attn_dec_i8_kernel (0: none)
     float* out;
     float* work;
 };
@@ -312,6 +314,13 @@ struct AttnSeqs {
     AttnRow r[kInklingSeqRows];
     __device__ AttnRow row(const AttnArgs&, int t) const { return r[t]; }
 };
+// the rows of a call whose splits are of `from` keys or more
+inline int rows_from(const AttnOne&, const AttnArgs& a, int ntok, int from) { return a.split >= from ? ntok : 0; }
+inline int rows_from(const AttnSeqs& s, const AttnArgs&, int ntok, int from) {
+    int n = 0;
+    for (int t = 0; t < ntok; ++t) n += s.r[t].split >= from;
+    return n;
+}
 
 // The splits of a token's head merged, in the splits' order, with its sink.  A block a head of a token, a thread a
 // value dimension.  A row of one split has its output from attn_dec_kernel.
@@ -374,6 +383,7 @@ __global__ void __launch_bounds__(DEC_WARPS * WARP, 5) attn_dec_kernel(AttnArgs 
     const int g = blockIdx.y, t = blockIdx.z, n_rel = a.rel.n_rel;
     const AttnRow r = rows.row(a, t);
     if ((int) blockIdx.x >= r.nslot) return;   // a row with fewer splits than the call's most
+    if (a.i8_from > 0 && r.split >= a.i8_from) return;   // attn_dec_i8_kernel's row
     const int p = int(r.pos);
     const int lo = a.window > 0 && p >= a.window ? p - a.window + 1 : 0;
     const int s = lo / r.split + blockIdx.x;
@@ -524,6 +534,227 @@ __global__ void __launch_bounds__(DEC_WARPS * WARP, 5) attn_dec_kernel(AttnArgs 
         float L = 0.0f, O = 0.0f;
 #pragma unroll
         for (int w = 0; w < DEC_WARPS; ++w) {
+            const float f = sm_m[w][h] == -INFINITY ? 0.0f : expf(sm_m[w][h] - M);
+            L += sm_l[w][h] * f;
+            O += sm_o[w][h][d] * f;
+        }
+        const size_t th = size_t(t) * a.n_head + g * AT_PER + h;
+        if (r.nslot > 1) {
+            float* wp = a.work + (th * a.nslot + blockIdx.x) * (AT_DIM + 2);
+            if (d == 0) wp[0] = M, wp[1] = L;
+            wp[2 + d] = O;
+        } else {
+            const float sink = a.sinks ? a.sinks[th] : -INFINITY;
+            const float mx = fmaxf(M, sink);
+            const float f = M == -INFINITY ? 0.0f : expf(M - mx);
+            const float denom = L * f + (sink == -INFINITY ? 0.0f : expf(sink - mx));
+            a.out[th * AT_DIM + d] = O * f / denom;
+        }
+    }
+}
+
+// The split path over Q8_0 keys and values with the queries quantized too (inkling_attend()'s int8_dot) for a
+// full layer's rows of splits of I8_MIN_SPLIT keys or more: the same splits, partials and join as attn_dec_kernel,
+// other arithmetic.  A window layer's splits are 32 keys (its window's), so it never comes here: no window, no
+// ring.  A key's 128 values go to 8 lanes, 16 each (one 16-byte load of its codes), so a warp reads 4 keys at once;
+// each 8-lane group takes I8_KEYS keys a step (the block's keys go to the warps in turn, counted from the split's
+// first key, and a warp's to its groups in turn) and keeps its own running max, sum and output for the group's
+// heads.  A score is the sum over the key's 32-value blocks of (its query's codes . the key's codes) * the query
+// block's delta * the key block's, the dot of 16 values four __dp4a; the query is quantized here about as
+// llama.cpp's flash-attention kernels quantize theirs for a quantized K (delta = the block's largest |value| / 127,
+// codes the values times 1 / delta rounded to the nearest, where llama.cpp divides).  The groups of a warp are
+// merged in their order at the end (lanes 8 and 16 apart), then the warps in theirs through shared memory.
+constexpr int I8_WARPS = 4, I8_LANES = 8, I8_KEYS = 2;
+// the shortest split it takes (a full layer's room of 32K): attn_dec_kernel was the faster on an RTX 2070 Super for
+// window layers (a token at 32767: 19.3 us against 26.3 here) and short rooms (at 4096: 52.3 against 55.0), this
+// one from 32K (at 32767: 254 us against 286)
+constexpr int I8_MIN_SPLIT = 512;
+constexpr int I8_DIMS = AT_DIM / I8_LANES;                        // a lane's values of a key: half a block
+constexpr int I8_WARP_KEYS = WARP / I8_LANES * I8_KEYS;           // a warp's keys a step
+constexpr int I8_STEP = I8_WARPS * I8_WARP_KEYS;                  // the block's
+constexpr int I8_RELS = (AT_MAX_REL + I8_LANES - 1) / I8_LANES;   // a lane's relative-position weights a head
+static_assert(I8_WARPS * WARP == AT_DIM, "attn_dec_i8_kernel's merge takes a thread a value dimension");
+static_assert(I8_DIMS * 2 == 32, "a lane's values are half of a Q8_0 block");
+
+// Four codes, unscaled, as floats: a code's byte offset by 128 under the bits of 2^23, less 2^23 + 128 (exact).
+__device__ __forceinline__ void codes4(int w, float* x) {
+    const unsigned u = unsigned(w) ^ 0x80808080u;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) x[j] = __uint_as_float(__byte_perm(u, 0x4b000000u, 0x7540 + j)) - 8388736.0f;
+}
+
+template <class Rows>
+__global__ void __launch_bounds__(I8_WARPS * WARP) attn_dec_i8_kernel(AttnArgs a, Rows rows) {
+    __shared__ float sm_m[I8_WARPS][AT_PER], sm_l[I8_WARPS][AT_PER];
+    __shared__ float sm_o[I8_WARPS][AT_PER][AT_DIM];
+    const int lane = threadIdx.x % WARP, warp = threadIdx.x / WARP, sub = lane % I8_LANES;
+    const int g = blockIdx.y, t = blockIdx.z, n_rel = a.rel.n_rel;
+    const AttnRow r = rows.row(a, t);
+    if ((int) blockIdx.x >= r.nslot || r.split < a.i8_from) return;   // fewer splits, or attn_dec_kernel's row
+    const int p = int(r.pos);
+    const int kb = blockIdx.x * r.split, ke = min(p + 1, kb + r.split);
+    // this lane's 16 query values of each head as codes, their block's delta times the score's scale
+    int qc[AT_PER][I8_DIMS / 4];
+    float qd[AT_PER], rr[AT_PER][I8_RELS], m[AT_PER], l[AT_PER], acc[AT_PER][I8_DIMS];
+#pragma unroll
+    for (int h = 0; h < AT_PER; ++h) {
+        const size_t th = size_t(t) * a.n_head + g * AT_PER + h;
+        float x[I8_DIMS], amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < I8_DIMS / 4; ++i) {
+            const float4 v = *reinterpret_cast<const float4*>(a.q + th * AT_DIM + I8_DIMS * sub + 4 * i);
+            x[4 * i] = v.x, x[4 * i + 1] = v.y, x[4 * i + 2] = v.z, x[4 * i + 3] = v.w;
+        }
+#pragma unroll
+        for (int i = 0; i < I8_DIMS; ++i) amax = fmaxf(amax, fabsf(x[i]));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1, WARP));   // the block's other half
+        const float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+#pragma unroll
+        for (int i = 0; i < I8_DIMS / 4; ++i) {
+            int w = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) w |= (int(roundf(x[4 * i + j] * id)) & 0xff) << (8 * j);
+            qc[h][i] = w;
+        }
+        qd[h] = d * a.scale;
+#pragma unroll
+        for (int i = 0; i < I8_RELS; ++i) {
+            const int j = sub + I8_LANES * i;
+            rr[h][i] = j < n_rel ? a.rel.r[th * n_rel + j] : 0.0f;
+        }
+        m[h] = -INFINITY, l[h] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < I8_DIMS; ++i) acc[h][i] = 0.0f;
+    }
+    int k0 = kb + warp * I8_WARP_KEYS + lane / I8_LANES * I8_KEYS;   // this lane's first key
+    for (int w0 = kb + warp * I8_WARP_KEYS; w0 < ke; w0 += I8_STEP) {
+        int4 kc[I8_KEYS], vc[I8_KEYS];
+        float kd[I8_KEYS], vd[I8_KEYS];
+        bool live[I8_KEYS];
+#pragma unroll
+        for (int c = 0; c < I8_KEYS; ++c) {
+            live[c] = k0 + c < ke;
+            const size_t base = (size_t(k0 + c) * a.kv_heads + g) * AT_DIM + I8_DIMS * sub;
+            if (live[c]) {
+                kc[c] = *reinterpret_cast<const int4*>(r.kq.codes + base);
+                vc[c] = *reinterpret_cast<const int4*>(r.vq.codes + base);
+                kd[c] = __half2float(__ushort_as_half(r.kq.scales[base / 32]));
+                vd[c] = __half2float(__ushort_as_half(r.vq.scales[base / 32]));
+            } else {
+                kc[c] = vc[c] = make_int4(0, 0, 0, 0);
+                kd[c] = vd[c] = 0.0f;
+            }
+        }
+        // a lane's share of each score: its 16 values' dot, scaled, and its share of the bias for keys near enough
+        float sc[AT_PER][I8_KEYS];
+#pragma unroll
+        for (int c = 0; c < I8_KEYS; ++c)
+#pragma unroll
+            for (int h = 0; h < AT_PER; ++h) {
+                int dot = STRATA_DP4A(qc[h][0], kc[c].x, 0);
+                dot = STRATA_DP4A(qc[h][1], kc[c].y, dot);
+                dot = STRATA_DP4A(qc[h][2], kc[c].z, dot);
+                dot = STRATA_DP4A(qc[h][3], kc[c].w, dot);
+                sc[h][c] = (float) dot * (qd[h] * kd[c]);
+            }
+        if (p - (k0 + I8_KEYS - 1) < a.rel.extent) {   // no shuffles in here: the groups may differ
+#pragma unroll
+            for (int c = 0; c < I8_KEYS; ++c) {
+                const int dist = p - (k0 + c);
+                if (!live[c] || dist >= a.rel.extent) continue;
+                const float* tb = a.rel.table + size_t(dist) * n_rel;
+#pragma unroll
+                for (int i = 0; i < I8_RELS; ++i) {
+                    const int j = sub + I8_LANES * i;
+                    if (j < n_rel) {
+                        const float w = tb[j];
+#pragma unroll
+                        for (int h = 0; h < AT_PER; ++h) sc[h][c] += w * rr[h][i];
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int o = I8_LANES / 2; o > 0; o >>= 1)
+#pragma unroll
+            for (int h = 0; h < AT_PER; ++h)
+#pragma unroll
+                for (int c = 0; c < I8_KEYS; ++c) sc[h][c] += __shfl_xor_sync(0xffffffffu, sc[h][c], o, WARP);
+        // the online softmax, then the values: each key's 16 values converted once for the three heads
+        float alpha[AT_PER], pv[AT_PER][I8_KEYS];
+#pragma unroll
+        for (int h = 0; h < AT_PER; ++h) {
+            float mx = -INFINITY;
+#pragma unroll
+            for (int c = 0; c < I8_KEYS; ++c)
+                if (live[c]) mx = fmaxf(mx, sc[h][c]);
+            const float m_new = fmaxf(m[h], mx);
+            alpha[h] = m[h] == -INFINITY ? 0.0f : expf(m[h] - m_new);
+            float sum = 0.0f;
+#pragma unroll
+            for (int c = 0; c < I8_KEYS; ++c) {
+                const float pc = live[c] ? expf(sc[h][c] - m_new) : 0.0f;   // m_new is finite with a live key
+                sum += pc;
+                pv[h][c] = pc * vd[c];
+            }
+            m[h] = m_new;
+            l[h] = l[h] * alpha[h] + sum;
+        }
+#pragma unroll
+        for (int h = 0; h < AT_PER; ++h)
+#pragma unroll
+            for (int i = 0; i < I8_DIMS; ++i) acc[h][i] *= alpha[h];
+#pragma unroll
+        for (int c = 0; c < I8_KEYS; ++c) {
+            float x[I8_DIMS];
+            codes4(vc[c].x, x), codes4(vc[c].y, x + 4), codes4(vc[c].z, x + 8), codes4(vc[c].w, x + 12);
+#pragma unroll
+            for (int h = 0; h < AT_PER; ++h)
+#pragma unroll
+                for (int i = 0; i < I8_DIMS; ++i) acc[h][i] += pv[h][c] * x[i];
+        }
+        k0 += I8_STEP;
+    }
+    // the warp's groups merged: group 0 with 1 and 2 with 3, then the pairs (the earlier group's terms first)
+#pragma unroll
+    for (int o = I8_LANES; o < WARP; o <<= 1)
+#pragma unroll
+        for (int h = 0; h < AT_PER; ++h) {
+            const float mo = __shfl_xor_sync(0xffffffffu, m[h], o, WARP);
+            const float lo_ = __shfl_xor_sync(0xffffffffu, l[h], o, WARP);
+            const bool first = (lane & o) == 0;
+            const float M = fmaxf(m[h], mo);
+            const float fa = m[h] == -INFINITY ? 0.0f : expf(m[h] - M);
+            const float fb = mo == -INFINITY ? 0.0f : expf(mo - M);
+            const float f0 = first ? fa : fb, f1 = first ? fb : fa;
+            const float l0 = first ? l[h] : lo_, l1 = first ? lo_ : l[h];
+            l[h] = l0 * f0 + l1 * f1;
+#pragma unroll
+            for (int i = 0; i < I8_DIMS; ++i) {
+                const float ao = __shfl_xor_sync(0xffffffffu, acc[h][i], o, WARP);
+                const float a0 = first ? acc[h][i] : ao, a1 = first ? ao : acc[h][i];
+                acc[h][i] = a0 * f0 + a1 * f1;
+            }
+            m[h] = M;
+        }
+    if (lane < I8_LANES) {
+#pragma unroll
+        for (int h = 0; h < AT_PER; ++h) {
+            if (lane == 0) sm_m[warp][h] = m[h], sm_l[warp][h] = l[h];
+#pragma unroll
+            for (int i = 0; i < I8_DIMS; ++i) sm_o[warp][h][I8_DIMS * sub + i] = acc[h][i];
+        }
+    }
+    __syncthreads();
+    const int d = threadIdx.x;   // a thread a value dimension
+#pragma unroll
+    for (int h = 0; h < AT_PER; ++h) {
+        float M = -INFINITY;
+#pragma unroll
+        for (int w = 0; w < I8_WARPS; ++w) M = fmaxf(M, sm_m[w][h]);
+        float L = 0.0f, O = 0.0f;
+#pragma unroll
+        for (int w = 0; w < I8_WARPS; ++w) {
             const float f = sm_m[w][h] == -INFINITY ? 0.0f : expf(sm_m[w][h] - M);
             L += sm_l[w][h] * f;
             O += sm_o[w][h][d] * f;
@@ -813,9 +1044,15 @@ void splits_of(long long span_room, int window, int& split, int& nslot) {
 }
 
 template <class Rows>
-void launch_dec(const AttnArgs& a, const Rows& rows, int ntok, bool kq, bool vq, cudaStream_t st) {
+void launch_dec(const AttnArgs& a, const Rows& rows, int ntok, bool kq, bool vq, bool int8_dot, cudaStream_t st) {
     const dim3 gd((unsigned) a.nslot, a.kv_heads, ntok);
-    if (kq && vq) attn_dec_kernel<true, true, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
+    if (int8_dot && kq && vq && a.window <= 0) {   // a full layer's rows of long splits by __dp4a, the others not
+        AttnArgs b = a;
+        b.i8_from = I8_MIN_SPLIT;
+        const int big = rows_from(rows, a, ntok, I8_MIN_SPLIT);
+        if (big > 0) attn_dec_i8_kernel<Rows><<<gd, I8_WARPS * WARP, 0, st>>>(b, rows);
+        if (big < ntok) attn_dec_kernel<true, true, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(b, rows);
+    } else if (kq && vq) attn_dec_kernel<true, true, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
     else if (kq) attn_dec_kernel<true, false, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
     else if (vq) attn_dec_kernel<false, true, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
     else attn_dec_kernel<false, false, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
@@ -1388,7 +1625,7 @@ AttnArgs attn_args(const char* who, const float* q, const InklingRel& rel, const
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
-                    int64_t room) {
+                    int64_t room, bool int8_dot) {
     if (rows <= 0) return;
     AttnArgs a =
         attn_args("inkling_attend", q, rel, sinks, rows, out, dim, n_head, kv_heads, scale, window, ring, work);
@@ -1406,7 +1643,7 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         splits_of(span_room, window, a.split, a.nslot);
         const size_t need = size_t(rows) * n_head * a.nslot * (AT_DIM + 2);
         if (need <= work_floats) {
-            launch_dec(a, AttnOne{}, rows, kq, vq, st);
+            launch_dec(a, AttnOne{}, rows, kq, vq, int8_dot, st);
             return;
         }
     }
@@ -1432,7 +1669,7 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
 
 void inkling_attend_seqs(const float* q, const InklingAttnSeq* seqs, int rows, InklingRel rel, const float* sinks,
                          float* out, int dim, int n_head, int kv_heads, float scale, int window, int ring,
-                         float* work, size_t work_floats, void* stream) {
+                         float* work, size_t work_floats, void* stream, bool int8_dot) {
     if (rows <= 0) return;
     if (rows > kInklingSeqRows || !work)
         throw std::invalid_argument("inkling_attend_seqs: 1 to " + std::to_string(kInklingSeqRows) +
@@ -1454,7 +1691,7 @@ void inkling_attend_seqs(const float* q, const InklingAttnSeq* seqs, int rows, I
     }
     if (size_t(rows) * n_head * a.nslot * (AT_DIM + 2) > work_floats)
         throw std::invalid_argument("inkling_attend_seqs: work too small");
-    launch_dec(a, r, rows, kq, vq, cs(stream));
+    launch_dec(a, r, rows, kq, vq, int8_dot, cs(stream));
 }
 
 namespace {

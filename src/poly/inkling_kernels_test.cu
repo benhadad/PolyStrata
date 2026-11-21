@@ -426,6 +426,7 @@ struct AttnCase {
     bool sinks;
     int check_every;          // check every n-th token of a long call (and its last, and the window's edge)
     Probe probe = Probe::none;
+    bool int8_dot = false;    // STRATA_KV_INT8's split path (inkling_attend()'s int8_dot)
 };
 
 void test_attend(const AttnCase& tc, const std::vector<float>& rand_table, float* rand_dtable) {
@@ -463,7 +464,7 @@ void test_attend(const AttnCase& tc, const std::vector<float>& rand_table, float
         const Kvq8 kq = tc.q8 ? Kvq8{c.kc, c.ks} : Kvq8{}, vq = tc.q8 ? Kvq8{c.vc, c.vs} : Kvq8{};
         const float scale = 1.f / std::sqrt((float) kDim);
         inkling_attend(dq, c.k, c.v, kq, vq, rel, tc.sinks ? ds : nullptr, pos, rows, dout, kDim, kHeads, kKv, scale,
-                       tc.window, tc.ring, work, work_n, nullptr, tc.room ? pos + rows + 517 : 0);
+                       tc.window, tc.ring, work, work_n, nullptr, tc.room ? pos + rows + 517 : 0, tc.int8_dot);
         ck(cudaGetLastError(), "attend");
         auto got = down(dout, q.size());
         std::vector<int> toks;
@@ -484,7 +485,9 @@ void test_attend(const AttnCase& tc, const std::vector<float>& rand_table, float
                                  std::to_string(rows) + " (" + std::to_string(toks.size()) + " checked)";
         double top = 1.0;
         for (double x : ref) top = std::max(top, std::fabs(x));
-        compare(name.c_str(), sel, ref, probe ? 1e-5 : mma_card && rows >= kInklingMmaRows ? kMmaRoom * top : 2e-5);
+        const double tol =
+            tc.int8_dot ? 2e-2 : probe ? 1e-5 : mma_card && rows >= kInklingMmaRows ? kMmaRoom * top : 2e-5;
+        compare(name.c_str(), sel, ref, tol);
         cudaFree(dq), cudaFree(dk), cudaFree(dv), cudaFree(dr), cudaFree(ds), cudaFree(dout);
         pos += rows;
     }
@@ -695,6 +698,44 @@ void same_bits(const char* what, const float* a, const float* b, size_t n) {
     for (size_t i = 0; i < n; ++i) diff += std::memcmp(&x[i], &y[i], 4) != 0;
     std::printf("%-58s %zu of %zu values differ  %s\n", what, diff, n, diff ? "FAIL" : "ok");
     if (diff) ++failures;
+}
+
+// STRATA_KV_INT8 where it does not apply: the same bits as without it (fp16 caches, window layers, rooms under 32K).
+void test_int8_unchanged(const std::vector<float>& table, float* dtable) {
+    const int ctx = 20000, window = 1024, rows = 7;
+    auto kv = randv(size_t(ctx) * kKv * kDim, 1.2f);
+    float* dkv = up(kv);
+    Cache cf, c8;
+    cf.alloc(ctx, false), c8.alloc(ctx, true);
+    store_f16(dkv, cf.k, kKv * kDim, 0, ctx, nullptr), store_f16(dkv, cf.v, kKv * kDim, 0, ctx, nullptr);
+    store_q8(dkv, c8.kc, c8.ks, kKv * kDim, 0, ctx, nullptr), store_q8(dkv, c8.vc, c8.vs, kKv * kDim, 0, ctx, nullptr);
+    float *q = up(randv(size_t(rows) * kHeads * kDim, 1.2f)), *r = up(randv(size_t(rows) * kHeads * kRel, 1.5f)),
+          *sk = up(randv(size_t(rows) * kHeads, 2.0f, 1.0f)), *o1, *o2, *work;
+    const size_t n = size_t(rows) * kHeads * kDim, wn = inkling_attend_work_floats(kHeads, kDim);
+    ck(cudaMalloc(&o1, n * 4), "malloc"), ck(cudaMalloc(&o2, n * 4), "malloc"), ck(cudaMalloc(&work, wn * 4), "malloc");
+    const InklingRel rel{r, dtable, kRel, kExtent};
+    struct Case {
+        const char* name;
+        bool q8;
+        int window;
+        long long pos, room;
+    };
+    const Case cases[] = {
+        {"int8 dot unchanged: q8_0 full, room 16384", true, 0, 12000, 16384},
+        {"int8 dot unchanged: q8_0 window (ring)", true, window, ctx - rows, 0},
+        {"int8 dot unchanged: fp16 full, room 32768", false, 0, ctx - rows, 32768},
+    };
+    for (const Case& k : cases) {
+        const Cache& c = k.q8 ? c8 : cf;
+        const Kvq8 kq = k.q8 ? Kvq8{c.kc, c.ks} : Kvq8{}, vq = k.q8 ? Kvq8{c.vc, c.vs} : Kvq8{};
+        const float sc = 1.f / std::sqrt((float) kDim);
+        for (int i8 = 0; i8 < 2; ++i8)
+            inkling_attend(q, c.k, c.v, kq, vq, rel, sk, k.pos, rows, i8 ? o2 : o1, kDim, kHeads, kKv, sc, k.window,
+                           k.window ? ctx : 0, work, wn, nullptr, k.room, i8 != 0);
+        same_bits(k.name, o1, o2, n);
+    }
+    cf.free_(), c8.free_();
+    cudaFree(dkv), cudaFree(q), cudaFree(r), cudaFree(sk), cudaFree(o1), cudaFree(o2), cudaFree(work);
 }
 
 // Random blocks of a format, n_in x n_out, on the card: random bytes with sane scales (fp16 d, and dmin where the
@@ -1084,7 +1125,8 @@ void test_kv_store_seqs(int rows, bool q8, bool taps, int ring) {
 // context, as Inkling::attn() does.  `alone`: rows before position 32 get no room (pos + 1, one split), so that a
 // call has rows of one split beside rows of several.
 void test_attend_seqs(int rows, bool q8, int window, const std::vector<float>& table, float* dtable,
-                      const std::vector<long long>& at = kSeqPos, long long context = 8192, bool alone = false) {
+                      const std::vector<long long>& at = kSeqPos, long long context = 8192, bool alone = false,
+                      bool int8_dot = false) {
     const int ring = window ? window + 1024 : 0;
     std::vector<Cache> c(rows);
     std::vector<InklingAttnSeq> seqs(rows);
@@ -1115,13 +1157,14 @@ void test_attend_seqs(int rows, bool q8, int window, const std::vector<float>& t
         inkling_attend(dq + size_t(t) * kHeads * kDim, s.kcache, s.vcache, s.kq8, s.vq8,
                        {dr + size_t(t) * kHeads * kRel, dtable, kRel, kExtent}, ds + size_t(t) * kHeads, s.pos, 1,
                        o1 + size_t(t) * kHeads * kDim, kDim, kHeads, kKv, scale, window, ring, work, wn, nullptr,
-                       s.room);
+                       s.room, int8_dot);
     }
     inkling_attend_seqs(dq, seqs.data(), rows, {dr, dtable, kRel, kExtent}, ds, o2, kDim, kHeads, kKv, scale, window,
-                        ring, work, wn, nullptr);
+                        ring, work, wn, nullptr, int8_dot);
     const std::string name = std::string("attend_seqs vs a row at a time, rows ") + std::to_string(rows) +
                              (q8 ? " q8_0" : " fp16") + (window ? " window" : " full") +
-                             (alone ? ", 1 split and more" : "") + (context > 8192 ? ", 128K" : "");
+                             (alone ? ", 1 split and more" : "") + (context > 8192 ? ", 128K" : "") +
+                             (int8_dot ? ", int8 dot" : "");
     same_bits(name.c_str(), o1, o2, q.size());
     for (Cache& x : c) x.free_();
     cudaFree(dq), cudaFree(dr), cudaFree(ds), cudaFree(o1), cudaFree(o2), cudaFree(work);
@@ -1198,7 +1241,10 @@ template <class F> float time_us(const char* what, F&& f, int reps = 200) {
 
 // A token's attention of a full layer at long contexts over a q8_0 cache (as large as the card holds, up to 1M
 // rows), sized as Engine::room(1) sizes it: the time, and the cache's bytes it reads over the time against the
-// card's memory bandwidth.
+// card's memory bandwidth.  Each case runs again and again, so a cache that fits in the card's L2 (a 32K room's is
+// 71 MB, 20480 tokens' 45 MB) can read faster than the memory
+// on a card with an L2 that large (an RTX 4090's is 72 MB; an RTX 2070 Super's 4 MB): such a rate says nothing of
+// the memory's.
 __global__ void fill_q8_kernel(int8_t* codes, uint16_t* scales, size_t n) {
     for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
         uint32_t h = uint32_t(i) * 2654435761u ^ uint32_t(i >> 32) * 40503u;
@@ -1240,13 +1286,15 @@ void bench_long_decode(float* dtable) {
         for (long long pos : {room - 1, room / 2 + room / 8}) {
             const std::string w = "attend q8_0 full, 1 token at " + std::to_string(pos) + ", room " +
                                   std::to_string(room);
-            const float us = time_us(w.c_str(), [&] {
-                inkling_attend(q, nullptr, nullptr, {kc, ks}, {vc, vs}, rel, s, pos, rows, out, kDim, kHeads, kKv,
-                               sc, 0, 0, work, wn, bs, room);
-            }, room >= 262144 ? 20 : 100);
-            const double rate = double(pos + 1) * row_bytes / (us * 1e-6);
-            std::printf("bench %-58s %9.1f GB/s, %.1f%% of the memory's\n", "  the cache read at", rate / 1e9,
-                        100.0 * rate / peak);
+            for (bool i8 : {false, true}) {
+                const float us = time_us((w + (i8 ? ", int8 dot" : "")).c_str(), [&] {
+                    inkling_attend(q, nullptr, nullptr, {kc, ks}, {vc, vs}, rel, s, pos, rows, out, kDim, kHeads,
+                                   kKv, sc, 0, 0, work, wn, bs, room, i8);
+                }, room >= 262144 ? 20 : 100);
+                const double rate = double(pos + 1) * row_bytes / (us * 1e-6);
+                std::printf("bench %-58s %9.1f GB/s, %.1f%% of the memory's\n", "  the cache read at", rate / 1e9,
+                            100.0 * rate / peak);
+            }
         }
     }
     ck(cudaDeviceSynchronize(), "long decode bench");
@@ -1398,6 +1446,7 @@ void bench_decode(const std::vector<float>& table, float* dtable) {
             bool q8;
             int pos, rows, window;
             long long room;   // 0: pos + rows
+            bool int8_dot = false;
         };
         const Case cases[] = {
             {"q8_0 full, 1 token at 25", true, 25, 1, 0, 0},
@@ -1411,6 +1460,7 @@ void bench_decode(const std::vector<float>& table, float* dtable) {
             {"q8_0 full, 1 token at 32767", true, 32767, 1, 0, 0},
             {"q8_0 swa,  1 token at 32767 (ring)", true, 32767, 1, window, 0},
             {"q8_0 swa,  7 tokens at 32760 (ring)", true, 32760, 7, window, 0},
+            {"q8_0 full, 1 token at 32767, int8 dot", true, 32767, 1, 0, 0, true},
             {"fp16 full, 1 token at 150", false, 150, 1, 0, 0},
             {"fp16 full, 1 token at 1024", false, 1024, 1, 0, 0},
             {"fp16 full, 1 token at 32767", false, 32767, 1, 0, 0},
@@ -1424,7 +1474,7 @@ void bench_decode(const std::vector<float>& table, float* dtable) {
             const std::string w = std::string("attend ") + k.name;
             time_us(w.c_str(), [&] {
                 inkling_attend(q, c.k, c.v, kq, vq, rel, s, k.pos, k.rows, out, kDim, kHeads, kKv, sc, k.window, rg,
-                               work, wn, bs, k.room);
+                               work, wn, bs, k.room, k.int8_dot);
             }, 50);
         }
         cf.free_(), c8.free_();
@@ -1534,6 +1584,10 @@ int main(int argc, char** argv) {
         {"attend full fp16 mma probe, extent's edge", 0, 0, false, {1000, 100}, false, false, false, 3, Probe::edge},
         {"attend swa fp16 mma probe, extent's edge, ring wrap", 1024, 1024 + 300, false, {1200, 300}, false, false,
          false, 3, Probe::edge},
+        // STRATA_KV_INT8: a full layer's rows of 512-key splits or more (a room of 32K or more), alone and 7 or 16 a
+        // call, to a looser bound (the queries are rounded to Q8_0 codes)
+        {"attend full q8_0 int8 dot, 33K", 0, 0, true, {33000, 1, 7, 16, 1}, true, true, true, 4999, Probe::none,
+         true},
     };
     for (const AttnCase& tc : cases) test_attend(tc, table, dtable);
     test_attend_alone(table, dtable);
@@ -1560,6 +1614,10 @@ int main(int argc, char** argv) {
             for (int rows : {1, 3, 9, kInklingSeqRows}) test_attend_seqs(rows, q8, window, table, dtable);
     for (int window : {0, 1024}) test_attend_seqs(9, false, window, table, dtable, kSeqPos, 8192, true);
     test_attend_seqs(2, true, 0, table, dtable, {131000, 70}, 131072);   // the largest split of a 128K context
+    // the int8 dot's rows alone and together: all of them past 16K (its kernel), and one beside a short one (both)
+    test_attend_seqs(4, true, 0, table, dtable, {20000, 40000, 70000, 131000}, 131072, false, true);
+    test_attend_seqs(2, true, 0, table, dtable, {131000, 70}, 131072, false, true);
+    test_int8_unchanged(table, dtable);
     test_seqs_refuse_rows();
     for (int rows : {1, 2, 4, 8}) {
         test_mmvq_jobs(8, "Q8_0", 2304, 8, rows);
