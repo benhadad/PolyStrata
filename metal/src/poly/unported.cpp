@@ -1,11 +1,12 @@
 // metal/src/poly/unported.cpp - the entry points of the shared strata-poly host code that have no Metal kernel yet.
 // None of them is on a Mac family's default path: llama.cpp's flash attention (which falls back to attend() and
 // attend_batch() by its own contract), Gemma 4's opt-in int8 attention caches, Clover's block guesses and coreset
-// routing, and the half-sum guard of Flint's MMQ.  A call that would need a kernel says what is missing instead of
-// computing something else.
+// routing, the half-sum guard of Flint's MMQ, and Inkling 2's SiTU (the engine does not run Inkling 2 on Metal).
+// A call that would need a kernel says what is missing instead of computing something else.
 #include "fattn.hpp"
 #include "mmq.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/poly/inkling_kernels.hpp"
 #include "strata/poly/kernels.hpp"
 
 #include <stdexcept>
@@ -68,6 +69,12 @@ bool Mmq::half_sums(int) { return false; }
 void guard_half_sums(float*, int64_t, int, int, float*, void*) { unported("half-sum guard (Flint)"); }
 void scale_rows(float*, int64_t, int, int, const int32_t*, const float*, bool, void*) {
     unported("half-sum guard (Flint)");
+}
+
+// Metal's tiles take no stream-k scratch: nothing to take ahead (Inkling 2's, which Metal does not run)
+void Mmq::reserve_fixup() {}
+void situ_rows(const float*, float*, int, int, float, float, void*, const ExpertScales*) {
+    unported("SiTU (Inkling 2)");
 }
 
 }  // namespace strata::poly
