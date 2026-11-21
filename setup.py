@@ -94,6 +94,8 @@ HF_REVISIONS = {
     "IsValorum/Clover-35B-A3B-Preview-APEX-I-NanoPlus-V2.1-GGUF": "d22b8db8efc6dfe15df84264e2fae26fafe530bb",  # 2026-10-28
     "Diffuspace/Clover-35B-A3B-Preview": "4b0402b65e523d0183a14c431955438714cb16ff",                     # 2026-10-28
     "unsloth/Ornith-1.5-122B-GGUF": "3842d003341507c216295c6f28dfcd30349925c6",                          # 2026-10-20
+    "ggml-org/Inkling-2-Mini-GGUF": "db61c5b492a6a034d986328d28274af0a439aa6c",                          # 2026-11-20
+    "unsloth/Inkling-2-Mini-GGUF": "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f",                           # 2026-11-21
     "ornith-ai/Ornith-1.5-122B": "dfa07bab90e90746ffbfc0b0cba3126eb9265de2",                              # 2026-10-20
 }
 
@@ -863,6 +865,41 @@ FAMILIES = {
                              (32785752352, "43bdc1b0cb764b5531d320816fb6004245256a414bfd55f1fdb69e3db42eaa57"),
                              "mmproj-F16.gguf":
                              (908724544, "39db176176a904b101f5173a4f03e785990f9279f94ab373c4fd629ae7011817")}},
+    # Inkling 2 Mini (llama.cpp's inkling2_loop, ggml-org/llama.cpp 29b52d398b): Thinking Machines' looped mixture of
+    # experts, 24 layers whose layers 6 to 17 run three times a token, 128 experts with 8 used.  ggml-org's GGUFs.
+    # Text only for now (the repository has an image encoder; it is not offered).  NVIDIA cards only ("cuda_only":
+    # the AMD build was not made for it), not run on Windows.  Its engine code takes one card ("one_card": no
+    # --layer-split yet) and one request at a time ("one_request": no --batch); its attention caches are fp16 or
+    # q8_0 (POLY_KV).  Measured on an RTX 2070 Super 8 GB with 62 GB of RAM (IQ4_NL): about 3.1 GiB of VRAM beside the
+    # experts at 8K in fp16, so "vram_beside_gb" 4.0 at 32K (the rows of the 8 full-attention passes: "row_bytes", 32 KiB a
+    # token in fp16, 17 KiB in q8_0; the 40 window passes' rings are fixed, ~0.3 GiB fp16, ~0.17 GiB q8_0); the engine's
+    # resident memory was 16.5 GiB.  "laptop_tps": 28 tokens/s after a 34.8K-token prompt, measured with q8_0 caches in a
+    # 128K context.  "arena_gb" is the files' expert tensors (IQ4_NL: layers 0-19 IQ4_NL, 20-23 Q8_0).  The
+    # experts the card does not hold stay in RAM, as for the others.  "sampling": the GGUF's general.sampling.*
+    # (temperature 1.0, top_k 50, top_p 1.0, min_p 0), written into a run config that has no sampling block of its own.
+    "inkling": {"title": "Inkling 2 Mini", "by": "Thinking Machines; GGUF by ggml-org",
+                "about": "on the strata-poly engine: one NVIDIA card, Linux; an 18 GB file, ~22 GB of RAM beside an "
+                         "8 GB card (16.5 GiB measured for the engine); a 2-bit and an 8-bit size too, no images",
+                "hf": hf("ggml-org/Inkling-2-Mini-GGUF"), "file": "Inkling-2-Mini-{q}.gguf", "shards": 1,
+                "tag": "inkling2-", "name": "inkling-2-mini", "engine": "poly", "vision": False,
+                "experimental": True, "windows": False, "cuda_only": True, "ran_on_gb": 8, "row_bytes": 32768,
+                "laptop_tps": {32768: "28"}, "one_card": True, "one_request": True,
+                "windows_risk": "Inkling 2 Mini has not been built or run on Windows",
+                "sampling": {"temperature": 1.0, "top_k": 50, "top_p": 1.0},
+                "models": {"IQ4_NL": {"about": "4-bit experts in layers 0-19 (imatrix), 8-bit everywhere else",
+                                      "download_gb": 17.6, "ram_gb": 22, "arena_gb": 15.8, "vram_beside_gb": 4.0},
+                           "UD-Q2_K_XL": {"about": "Unsloth's 2-bit experts, higher where it matters: the fastest and "
+                                                   "the least RAM (9 GB measured), a little less accurate",
+                                          "download_gb": 9.1, "ram_gb": 14, "arena_gb": 8.4, "vram_beside_gb": 4.0,
+                                          "hf": hf("unsloth/Inkling-2-Mini-GGUF")},
+                           "Q8_0": {"about": "8-bit throughout: the closest to the model as trained",
+                                    "download_gb": 27.8, "ram_gb": 32, "arena_gb": 26.0, "vram_beside_gb": 4.0}},
+                "sha256": {"Inkling-2-Mini-IQ4_NL.gguf":
+                           (17627940768, "cbdf3fa9dc50a4124977980f37da4f1fa764b0cfe800d275cd43d26ce2a81af4"),
+                           "Inkling-2-Mini-UD-Q2_K_XL.gguf":
+                           (9138715328, "20292e8142b69535ca88a5d04439d0fdeb4dc698d44c002dca706dcf92901441"),
+                           "Inkling-2-Mini-Q8_0.gguf":
+                           (27820099264, "d57542f8aea5d7639beba5fc4ae7f584754916f63ac5d5a69328c27f652f45da")}},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # Qwen3.6-35B-A3B (GGUF architecture qwen35moe), Unsloth's GGUFs with the MTP block: a family with an engine path of its
@@ -2390,7 +2427,8 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False) -> None:
 # general.architecture of each strata-poly family's GGUFs, the name Engine::open() (src/poly/engine.cpp) picks its
 # code by; the families not listed are qwen35moe
 POLY_GGUF_ARCHS = {"glm": ("glm5-next", "glm5next"), "deepseek": ("deepseek4",), "lfm25": ("lfm2moe",),
-                   "gemma4": ("gemma4",), "flint": ("flint",), "kolibri": ("kolibri1",), "clover": ("clover_moe",)}
+                   "gemma4": ("gemma4",), "flint": ("flint",), "kolibri": ("kolibri1",), "clover": ("clover_moe",),
+                   "inkling": ("inkling2_loop", "inkling2")}
 
 
 def gguf_arch(s: Path) -> str:
@@ -3026,8 +3064,9 @@ def unsloth_default_env(family: str, model: str, hip: bool, in_budget: bool) -> 
 
 def menu_families(hip: bool) -> list:
     """The families the model menu lists, in menu order.  The NVFP4 packs run on NVIDIA cards only (the AMD and Intel
-    engines have no NVFP4 kernels), so on those the menu does not offer them; `--family nvfp4` still says why not."""
-    return [f for f in FAMILIES if not (hip and FAMILIES[f].get("ready"))]
+    engines have no NVFP4 kernels), so on those the menu does not offer them; `--family nvfp4` still says why not.
+    A family marked "cuda_only" (Inkling 2 Mini) is left out there too."""
+    return [f for f in FAMILIES if not (hip and (FAMILIES[f].get("ready") or FAMILIES[f].get("cuda_only")))]
 
 
 def nvfp4_card_note(gpu) -> str:
@@ -5496,6 +5535,15 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None) ->
             if dropped else ""))
 
 
+def config_has(path, key: str) -> bool:
+    """Whether the run config at `path` (None: none) is a JSON object with `key`."""
+    try:
+        cfg = json.loads(Path(path).read_text(encoding="utf-8-sig")) if path is not None else None
+    except (OSError, ValueError):
+        return False
+    return isinstance(cfg, dict) and key in cfg
+
+
 def readable_config(path: Path) -> bool:
     """#459: a config that parses as a JSON object; any other gets a one-line warning naming it."""
     text = None
@@ -6526,7 +6574,7 @@ def poly_verdict(d, ram, vram_gb, hip, windows=False) -> str:
 
 # --kv for a model of strata-poly (docs/Q8_KV.md): the formats its architecture's attention caches have beside
 # fp16, the default.  The other engine's own are STRATA_KV.
-POLY_KV = {"q8_0": ("qwen36", "ornith", "ornith122", "tiel", "minicpmv", "kolibri", "flint", "lfm25"),
+POLY_KV = {"q8_0": ("qwen36", "ornith", "ornith122", "tiel", "minicpmv", "kolibri", "flint", "lfm25", "inkling"),
            "int8": ("gemma4",), "int8k": ("gemma4",)}
 STRATA_KV = ("int8", "q4_0", "k8v4")
 
@@ -6913,8 +6961,9 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         warn(f"{title}'s engine with CUDA 12 is compiled here (the ready-made one is CUDA 13)" +
              (": on Pascal / Volta it is untested" if int(gpu["arch"]) < CUDA13_MIN_ARCH else ""))
     if WIN and not fam.get("windows"):
-        confirm_risk(f"{title} has been run on Linux only: its engine compiles on Windows, the model was not tried "
-                     "there", bool(a.family), a.yes, f"{title} has not been tried on Windows",
+        confirm_risk(fam.get("windows_risk") or f"{title} has been run on Linux only: its engine compiles on "
+                     "Windows, the model was not tried there", bool(a.family), a.yes,
+                     f"{title} has not been tried on Windows",
                      f"use Linux, or --family {family} --yes to try it here")
     sees = fam.get("vision") is True
     if sees and hip:   # the image encoder is a CUDA program: no HIP build of it yet (as for the main engine)
@@ -6933,6 +6982,9 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     if unused:
         warn(f"not used with {title} (its engine has no such setting): " + ", ".join(unused))
 
+    if multi and fam.get("one_card"):
+        fail(f"{title} runs on one card for now: its engine code has no layer split yet",
+             f"choose one card with --gpu N (one of {', '.join(str(i) for i in multi)})")
     sizes = family_models(family)
     names = list(sizes)
     if a.model and a.model not in names:
@@ -7264,10 +7316,22 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     # requests at once: written only when given, else an earlier "parallel" is carried over (write_setup_config)
-    if a.parallel is not None:
-        cfg["parallel"] = a.parallel if a.parallel >= 2 else 1
-    for line in poly_parallel_note(a.parallel, d, vram):
-        (ok if a.parallel is not None else say)(line if a.parallel is not None else "  " + line)
+    if fam.get("one_request"):
+        # its engine code takes one request at a time for now (no --batch): "parallel" 1, also over an earlier
+        # config's, and none is suggested
+        if a.parallel is not None and a.parallel >= 2:
+            warn(f"--parallel {a.parallel}: {title} answers one request at a time for now; not written")
+        cfg["parallel"] = 1
+    else:
+        if a.parallel is not None:
+            cfg["parallel"] = a.parallel if a.parallel >= 2 else 1
+        for line in poly_parallel_note(a.parallel, d, vram):
+            (ok if a.parallel is not None else say)(line if a.parallel is not None else "  " + line)
+    if fam.get("sampling") and not config_has(cfg_path if cfg_path.is_file() else earlier, "sampling"):
+        # the model's own defaults (its GGUF's general.sampling.*): a "sampling" block of the user's is kept instead
+        cfg["sampling"] = dict(fam["sampling"])
+        ok("sampling defaults: " + ", ".join(f"{k} {v}" for k, v in cfg["sampling"].items()) +
+           " (the model's own; \"sampling\" in the config)")
     poly_kv_whole(cfg)
     warm_start_into(cfg, a)
     write_setup_config(cfg_path, cfg, earlier)
@@ -7850,7 +7914,8 @@ def main() -> int:
                          "DeepSeek V4 Flash, lfm25 = LFM2.5-24B-A2B, flint = Flint 40B-A2.5B, qwen36 = "
                          "Qwen3.6-35B-A3B on strata-poly, clover = Clover-35B-A3B-Preview, ornith = "
                          "Ornith 1.5, gemma4 = Gemma 4 26B-A4B, tiel = Tiel Coder 35B-A3B, minicpmv = MiniCPM-V 4.7 "
-                         "35B-A3B, ornith122 = Ornith 1.5 122B (docs/BACKENDS.md), qwen36-strata = Qwen3.6-35B-A3B on the Strata project's "
+                         "35B-A3B, ornith122 = Ornith 1.5 122B (docs/BACKENDS.md), inkling = Inkling 2 Mini "
+                         "(experimental, NVIDIA only, docs/models/inkling.md), qwen36-strata = Qwen3.6-35B-A3B on the Strata project's "
                          "own engine (UD-Q4_K_XL and up, 32 GB of RAM or more; pictures with --vision, several "
                          "requests at once with --parallel; docs/QWEN36.md)")
     ap.add_argument("--model", choices=list(dict.fromkeys(
@@ -8305,6 +8370,9 @@ def main() -> int:
             say(f"  {m:8s} needs ~{d['ram_gb']} GB RAM: {verdict}")
         for f, fd in FAMILIES.items():                  # the families with sizes of their own
             for m, d in fd.get("models", {}).items():
+                if hip and fd.get("cuda_only"):
+                    say(f"  {fd['title']} {m}: NVIDIA only (not built or run for AMD cards)")
+                    continue
                 any_fits = any_fits or poly_fits(d, ram, gpu["vram_gb"], hip)
                 say(f"  {fd['title']} {m}: {poly_verdict(d, ram, gpu['vram_gb'], hip, bool(fd.get('windows')))}")
         if not any_fits:
@@ -8339,6 +8407,9 @@ def main() -> int:
     if family in OWN_PATH_FAMILIES:                    # Qwen3.6: its own engine path, its own steps 2-7
         return install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted)
     fam = FAMILIES[family]
+    if fam.get("cuda_only") and hip:
+        fail(f"{fam['title']} runs on NVIDIA cards only for now: its engine code was not built or run for AMD cards",
+             "use an NVIDIA card, or choose another model")
     if fam.get("ready") and hip:
         # not a risk the user could take: the HIP engine has no NVFP4 expert kernels at all, so it would not start
         fail(f"{fam['title']} runs on NVIDIA cards only: the AMD engine has no NVFP4 kernels",
