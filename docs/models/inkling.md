@@ -23,6 +23,11 @@ the same at 29 to 32 of 32 steps with llama.cpp's own answer fed in.
 | 1,500-token prompt | 452-455 tokens/s | 36.1-36.5 tokens/s | 586-611 tokens/s | 46.7-48.1 tokens/s |
 | 34,800-token prompt (IQ4_NL, through the server, an earlier day) | 232 tokens/s | 28.1 tokens/s | | |
 
+Since these rows the engine takes a visit's projections in one launch and its cached experts a warp a row. In
+back-to-back runs of strata-poly alone (the same flags, 2026-11-22, two runs each) writing after the 302-token prompt
+went from 38.2-38.7 to 39.0-39.5 tokens/s with IQ4_NL (+2%, with a copy of its expert profile) and from 51.2-51.9 to
+54.6-55.2 with UD-Q2_K_XL (+6%, without one).
+
 A prompt batch's attention runs on the tensor cores (cards of Turing or newer). Next to the build before it
 (2026-11-22, the same card; `strata-poly --serve`, a 128K context, q8_0 caches, one engine a run, each from a fresh
 copy of the model's expert profile, the prompt read in a fresh conversation; text from the parity prompts repeated;
@@ -107,7 +112,7 @@ the others write, answers of 64 to 16 tokens, so that a step has 1 to 4 of them)
 
 > **Measured on:** RTX 2070 Super 8 GB, Ryzen 5 3600XT, 62 GB DDR4, Ubuntu 22.04: the server's config (128K context,
 > q8_0 caches, the expert profile), chats of 300 tokens started together (greedy, thinking off), two runs each; the
-> server was started again for each row.
+> server was started again for each row. Measured before the change of 2026-11-22 above.
 
 | Chats at once | `"parallel"` | IQ4_NL, all together | IQ4_NL, each chat | UD-Q2_K_XL, all together | UD-Q2_K_XL, each chat | Experts in VRAM (IQ4_NL / UD-Q2_K_XL) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
