@@ -171,23 +171,36 @@ class Main(unittest.TestCase):
         self.assertIn("Inkling 2 Mini has not been built or run on Windows", out)
         self.assertNotIn("has been run on Linux only", out)
 
-    def test_one_card_and_one_request_at_a_time(self):
-        # its engine code has no --layer-split and no --batch yet: setup writes neither
+    def test_one_card(self):
+        # its engine code has no --layer-split yet: setup writes none
         code, out, _ = self.main(["--gpus", "0,1"], family="inkling", ram=64.0, n_gpus=2)
         self.assertNotEqual(code, 0)
         self.assertIn("runs on one card for now", out)
         code, out, cfg = self.main(["--gpu", "1"], family="inkling", ram=64.0, n_gpus=2)
         self.assertEqual(code, 0, out)
         self.assertEqual(cfg["gpu"], 1)
-        code, out, cfg = self.main(["--parallel", "3"], family="inkling", ram=64.0)
-        self.assertEqual(code, 0, out)
-        self.assertEqual(cfg["parallel"], 1)          # 1 also over an earlier config's "parallel"
-        self.assertIn("answers one request at a time for now", out)
-        self.assertNotIn("Several requests at once", out)
         code, out, cfg = self.main(["--kv", "q8_0"], family="inkling", ram=64.0)
         self.assertEqual(code, 0, out)
         self.assertIn("--kv", cfg["args"])
         self.assertEqual(cfg["args"][cfg["args"].index("--kv") + 1], "q8_0")
+
+    def test_requests_at_once(self):
+        # "parallel" as for the other families of strata-poly: written when asked, suggested where it pays
+        self.assertNotIn("one_request", FAM)
+        code, out, cfg = self.main(["--parallel", "3"], family="inkling", ram=64.0)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["parallel"], 3)
+        self.assertIn("parallel requests: 3 at once", out)
+        code, out, cfg = self.main(family="inkling", ram=64.0, vram=8188 / 1024)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["parallel"], 3)                # the earlier config's, carried over
+        self.assertIn("Several requests at once (opt-in, --parallel N)", out)   # an 8 GB card: most experts on the CPU
+        code, out, cfg = self.main(["--parallel", "1"], family="inkling", ram=64.0)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["parallel"], 1)
+        code, out, cfg = self.main(family="inkling", ram=64.0)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["parallel"], 1)                # an earlier "parallel": 1 is kept too
 
     def test_no_images_unless_asked(self):
         code, out, cfg = self.main(family="inkling", ram=64.0, vram=8188 / 1024)      # --yes: the default, no

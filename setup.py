@@ -880,7 +880,7 @@ FAMILIES = {
     # the engine's prompt logits with either one's rows were as close to llama.cpp's (cosine 0.99989 or more, the same
     # greedy tokens, 2 pictures).
     # NVIDIA cards only ("cuda_only": the AMD build was not made for it), not run on Windows.  Its engine code takes
-    # one card ("one_card": no --layer-split yet) and one request at a time ("one_request": no --batch); its attention
+    # one card ("one_card": no --layer-split yet); "parallel" (--batch) as for the other families; its attention
     # caches are fp16 or q8_0 (POLY_KV).  Measured on an RTX 2070 Super 8 GB with 62 GB of RAM (IQ4_NL): about 3.1 GiB
     # of VRAM beside the experts at 8K in fp16, so "vram_beside_gb" 4.0 at 32K (the rows of the 8 full-attention passes:
     # "row_bytes", 32 KiB a token in fp16, 17 KiB in q8_0; the 40 window passes' rings are fixed, ~0.3 GiB fp16, ~0.17
@@ -897,7 +897,7 @@ FAMILIES = {
                 "vision_llama": INKLING_VISION_LLAMA_CPP_COMMIT, "mmproj_hf": hf("ggml-org/Inkling-2-Mini-GGUF"),
                 "mmproj": "mmproj-Inkling-2-Mini-Q8_0.gguf", "vision_gb": 0.35, "vision_vram_gb": 0.6,
                 "experimental": True, "windows": False, "cuda_only": True, "ran_on_gb": 8, "row_bytes": 32768,
-                "laptop_tps": {32768: "28"}, "one_card": True, "one_request": True,
+                "laptop_tps": {32768: "28"}, "one_card": True,
                 "windows_risk": "Inkling 2 Mini has not been built or run on Windows",
                 "sampling": {"temperature": 1.0, "top_k": 50, "top_p": 1.0},
                 "models": {"IQ4_NL": {"about": "4-bit experts in layers 0-19 (imatrix), 8-bit everywhere else",
@@ -7442,17 +7442,10 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     # requests at once: written only when given, else an earlier "parallel" is carried over (write_setup_config)
-    if fam.get("one_request"):
-        # its engine code takes one request at a time for now (no --batch): "parallel" 1, also over an earlier
-        # config's, and none is suggested
-        if a.parallel is not None and a.parallel >= 2:
-            warn(f"--parallel {a.parallel}: {title} answers one request at a time for now; not written")
-        cfg["parallel"] = 1
-    else:
-        if a.parallel is not None:
-            cfg["parallel"] = a.parallel if a.parallel >= 2 else 1
-        for line in poly_parallel_note(a.parallel, d, vram):
-            (ok if a.parallel is not None else say)(line if a.parallel is not None else "  " + line)
+    if a.parallel is not None:
+        cfg["parallel"] = a.parallel if a.parallel >= 2 else 1
+    for line in poly_parallel_note(a.parallel, d, vram):
+        (ok if a.parallel is not None else say)(line if a.parallel is not None else "  " + line)
     if fam.get("sampling") and not config_has(cfg_path if cfg_path.is_file() else earlier, "sampling"):
         # the model's own defaults (its GGUF's general.sampling.*): a "sampling" block of the user's is kept instead
         cfg["sampling"] = dict(fam["sampling"])
