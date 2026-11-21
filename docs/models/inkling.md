@@ -14,13 +14,14 @@ the same at 29 to 32 of 32 steps with llama.cpp's own answer fed in.
 ## How fast is it?
 
 > **Measured on:** RTX 2070 Super 8 GB, Ryzen 5 3600XT, 62 GB DDR4, Ubuntu 22.04, one request, warm file cache, the
-> server's flags (128K context, q8_0 caches).
+> server's flags (128K context, q8_0 caches, the model's expert profile), 128 tokens written, two runs each, the
+> 302- and 1,500-token rows on the same day.
 
 | | IQ4_NL prompt | IQ4_NL writing | UD-Q2_K_XL prompt | UD-Q2_K_XL writing |
 | --- | ---: | ---: | ---: | ---: |
-| 302-token prompt | 270 tokens/s | 37.4 tokens/s | 366 tokens/s | 46.9 tokens/s |
-| 1,500-token prompt | 434 tokens/s | 36.7 tokens/s | 544 tokens/s | 45.2 tokens/s |
-| 34,800-token prompt (IQ4_NL, through the server) | 232 tokens/s | 28.1 tokens/s | | |
+| 302-token prompt | 273-275 tokens/s | 37.3-38.1 tokens/s | 503-511 tokens/s | 50.7-53.0 tokens/s |
+| 1,500-token prompt | 452-455 tokens/s | 36.1-36.5 tokens/s | 586-611 tokens/s | 46.7-48.1 tokens/s |
+| 34,800-token prompt (IQ4_NL, through the server, an earlier day) | 232 tokens/s | 28.1 tokens/s | | |
 
 IQ4_NL's speed depends on its expert profile (`--expert-profile`, which the server keeps up to date): it chooses the
 experts the card holds. On 100 questions (50 GSM8K, 50 MMLU-Pro, greedy, medium reasoning) IQ4_NL got 49 and 44
@@ -39,12 +40,13 @@ About 4.6 GiB of experts fit on the 8 GB card. At most 7.5 GiB of VRAM was in us
 | **System** | Linux and a current NVIDIA driver. Setup asks before it installs it on Windows: it was not built or run there. |
 
 It is not offered on AMD or Intel cards or on a Mac: the engine code for it was written for NVIDIA cards only. For now
-it also runs on one card (no layer split) and answers one request at a time (no `--parallel`); setup leaves those
-options out for it. Its attention caches are fp16, or q8_0 with `--kv q8_0`, which halves them: a 128K context then
-takes about 2.3 GiB of VRAM when it is full, in fp16 4.3 GiB. On an 8 GB card, use q8_0 for contexts past 32K. The file allows
-1,048,576 tokens and the engine sets no limit of its own, but the cache stays in VRAM (about 17 KiB a token in q8_0;
-the engine's KV streaming is not wired up for this model), and it was tried up to a 128K context, with prompts of up
-to 35K tokens. Pictures are optional: see [Images](#images). It has no draft model, so it writes one token at a time.
+it also runs on one card (no layer split); setup leaves that option out for it. It can answer several requests at once
+(`--parallel`, see [Several requests at once](#several-requests-at-once)). Its attention caches are fp16, or q8_0 with
+`--kv q8_0`, which halves them: a 128K context then takes about 2.3 GiB of VRAM when it is full, in fp16 4.3 GiB. On an
+8 GB card, use q8_0 for contexts past 32K. The file allows 1,048,576 tokens and the engine sets no limit of its own, but
+the cache stays in VRAM (about 17 KiB a token in q8_0; the engine's KV streaming is not wired up for this model), and it
+was tried up to a 128K context, with prompts of up to 35K tokens. Pictures are optional: see [Images](#images). It has
+no draft model, so it writes one token at a time.
 
 ## Install
 
@@ -71,6 +73,40 @@ to 35K tokens. Pictures are optional: see [Images](#images). It has no draft mod
 Setup takes IQ4_NL unless you name another size. UD-Q2_K_XL comes from Unsloth's repository in the architecture's
 native form (`inkling2`, the loop not unrolled); the engine reads that form as it is. Q8_0 was not run. ggml-org's model card gives the KL divergence against the BF16 file on
 wikitext-2: 0.0030 for Q8_0 and 0.0095 for IQ4_NL. PolyStrata did not measure that.
+
+## Several requests at once
+
+With `"parallel": N` in the run config (or `--parallel N` when you run setup) the engine answers up to N requests
+together, as for the other models of strata-poly ([BATCHING.md](../BATCHING.md)). Each request then has its own
+attention caches and convolution state. A token of every request goes through the model in one pass, so the dense
+weights, and each expert that two requests both use, are read once for all of them. With the expert cache held still
+(`--check-batch`, [BATCHING.md](../BATCHING.md)), every sequence got the tokens it gets alone: IQ4_NL and UD-Q2_K_XL,
+fp16 and q8_0 caches, 2, 3 and 4 sequences after a 302-token prompt and 4 after a 3,000-token one, and 4 sequences
+that start, join and stop at different times (`--check-stagger`: prompts of 16, 46, 375 and 3,000 tokens, read while
+the others write, answers of 64 to 16 tokens, so that a step has 1 to 4 of them).
+
+> **Measured on:** RTX 2070 Super 8 GB, Ryzen 5 3600XT, 62 GB DDR4, Ubuntu 22.04: the server's config (128K context,
+> q8_0 caches, the expert profile), chats of 300 tokens started together (greedy, thinking off), two runs each; the
+> server was started again for each row.
+
+| Chats at once | `"parallel"` | IQ4_NL, all together | IQ4_NL, each chat | UD-Q2_K_XL, all together | UD-Q2_K_XL, each chat | Experts in VRAM (IQ4_NL / UD-Q2_K_XL) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 37.1-37.7 tokens/s | 39.6-40.2 | 46.2-47.8 | 49.6-51.2 | 1,034 / 2,005 |
+| 1 | 4 | 34.5-35.0 | 36.9-37.6 | 44.3-44.9 | 46.7-47.4 | 782 / 1,547 |
+| 2 | 2 | 44.6-45.5 | 23.5-24.9 | 57.7-59.7 | 30.1-32.1 | 911 / 1,777 |
+| 3 | 3 | 48.9-49.0 | 17.0-18.2 | 63.2-64.5 | 21.9-23.2 | 849 / 1,663 |
+| 4 | 4 | 51.2-51.9 | 13.3-14.4 | 64.1-66.5 | 16.6-18.0 | 786 / 1,547 |
+
+"All together" is the tokens of all the chats over the time from the first request to the last answer, prompts
+included. "Each chat" is a chat's writing speed as the server reports it (`timings`). On this card most experts run
+on the CPU, and requests that route to different experts each need their own, so four chats together wrote 1.34 to
+1.44 times as much as one alone. One chat with `"parallel": 4` was 3 to 9% slower than with 1: the slots' VRAM leaves
+fewer experts on the card. A card that holds more of the experts may gain more; that was not measured.
+
+Each slot takes VRAM from the expert cache at load: its 40 window layers' rows and its convolution state. With q8_0
+caches `"parallel": 2` took about 0.5 GiB (it adds two sequences beside the first) and each slot after it about
+0.27 GiB (the experts the cache held less, at the average size of a cached expert). Its full-attention rows (17 KiB a
+token in q8_0) come out of the cache as its conversation grows, as the first request's do.
 
 ## Images
 
