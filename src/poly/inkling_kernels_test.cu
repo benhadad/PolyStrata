@@ -8,7 +8,8 @@
 // (MmvqSlots::lanes) against each matrix alone, to the bit.
 //
 // usage: poly_inkling_kernels_test [bench | decode]   (exit 0: every check within its tolerance; 77: no usable card;
-//        bench: also time the attention and the decode shapes; decode: only the decode-shape timings)
+//        bench: also time the attention and the decode shapes; decode: only the decode-shape timings, with a
+//        token's attention over a q8_0 cache of up to 1M rows and the rate it reads it at)
 #include "strata/poly/inkling_kernels.hpp"
 #include "strata/poly/kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -1166,7 +1167,7 @@ void test_seqs_refuse_rows() {
 // case runs `reps` times as one CUDA graph (no host launch cost between the calls), replayed 5 times; the fastest
 // replay is reported.  The functions take the stream the graph is captured on.
 cudaStream_t bs = nullptr;
-template <class F> void time_us(const char* what, F&& f, int reps = 200) {
+template <class F> float time_us(const char* what, F&& f, int reps = 200) {
     if (!bs) cudaStreamCreateWithFlags(&bs, cudaStreamNonBlocking);
     ck(cudaDeviceSynchronize(), "before the timing");   // the setup ran on the legacy stream
     f();   // warm-up
@@ -1192,6 +1193,65 @@ template <class F> void time_us(const char* what, F&& f, int reps = 200) {
     std::printf("bench %-58s %9.2f us\n", what, 1000.f * best / reps);
     cudaEventDestroy(e0), cudaEventDestroy(e1);
     cudaGraphExecDestroy(ex), cudaGraphDestroy(gr);
+    return 1000.f * best / reps;
+}
+
+// A token's attention of a full layer at long contexts over a q8_0 cache (as large as the card holds, up to 1M
+// rows), sized as Engine::room(1) sizes it: the time, and the cache's bytes it reads over the time against the
+// card's memory bandwidth.
+__global__ void fill_q8_kernel(int8_t* codes, uint16_t* scales, size_t n) {
+    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        uint32_t h = uint32_t(i) * 2654435761u ^ uint32_t(i >> 32) * 40503u;
+        h ^= h >> 15, h *= 2246822519u, h ^= h >> 13;
+        codes[i] = (int8_t) (h & 0xff);
+        if (i % 32 == 0) scales[i / 32] = __half_as_ushort(__float2half(0.002f + (h >> 20) * 1e-5f));
+    }
+}
+
+void bench_long_decode(float* dtable) {
+    int clock_khz = 0, bus_bits = 0;
+    cudaDeviceGetAttribute(&clock_khz, cudaDevAttrMemoryClockRate, 0);
+    cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, 0);
+    const double peak = 2.0 * clock_khz * 1e3 * bus_bits / 8;   // bytes a second
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    const size_t row_bytes = size_t(kKv) * kDim * 2 * 34 / 32;   // K and V codes and scales a position
+    long long cap = 0;
+    for (long long c : {32768LL, 131072LL, 262144LL, 524288LL, 1048576LL})
+        if (size_t(c) * row_bytes + (size_t(256) << 20) < free_b) cap = c;
+    if (!cap) return;
+    const size_t n = size_t(cap) * kKv * kDim;
+    int8_t *kc = nullptr, *vc = nullptr;
+    uint16_t *ks = nullptr, *vs = nullptr;
+    ck(cudaMalloc(&kc, n), "malloc"), ck(cudaMalloc(&vc, n), "malloc");
+    ck(cudaMalloc(&ks, n / 16), "malloc"), ck(cudaMalloc(&vs, n / 16), "malloc");
+    fill_q8_kernel<<<1024, 256>>>(kc, ks, n);
+    fill_q8_kernel<<<1024, 256>>>(vc, vs, n);
+    const int rows = 1;
+    float *q = up(randv(size_t(rows) * kHeads * kDim, 1.0f)), *r = up(randv(size_t(rows) * kHeads * kRel, 1.0f)),
+          *s = up(randv(size_t(rows) * kHeads, 1.0f)), *out = nullptr, *work = nullptr;
+    ck(cudaMalloc(&out, size_t(rows) * kHeads * kDim * 4), "malloc");
+    const size_t wn = inkling_attend_work_floats(kHeads, kDim);
+    ck(cudaMalloc(&work, wn * 4), "malloc");
+    const InklingRel rel{r, dtable, kRel, kExtent};
+    const float sc = 1.f / std::sqrt((float) kDim);
+    std::printf("bench long decode: memory %.0f GB/s (%d kHz x %d bits)\n", peak / 1e9, clock_khz, bus_bits);
+    for (long long room = 32768; room <= cap; room *= 2) {
+        for (long long pos : {room - 1, room / 2 + room / 8}) {
+            const std::string w = "attend q8_0 full, 1 token at " + std::to_string(pos) + ", room " +
+                                  std::to_string(room);
+            const float us = time_us(w.c_str(), [&] {
+                inkling_attend(q, nullptr, nullptr, {kc, ks}, {vc, vs}, rel, s, pos, rows, out, kDim, kHeads, kKv,
+                               sc, 0, 0, work, wn, bs, room);
+            }, room >= 262144 ? 20 : 100);
+            const double rate = double(pos + 1) * row_bytes / (us * 1e-6);
+            std::printf("bench %-58s %9.1f GB/s, %.1f%% of the memory's\n", "  the cache read at", rate / 1e9,
+                        100.0 * rate / peak);
+        }
+    }
+    ck(cudaDeviceSynchronize(), "long decode bench");
+    cudaFree(kc), cudaFree(vc), cudaFree(ks), cudaFree(vs);
+    cudaFree(q), cudaFree(r), cudaFree(s), cudaFree(out), cudaFree(work);
 }
 
 void bench_decode(const std::vector<float>& table, float* dtable) {
@@ -1370,6 +1430,7 @@ void bench_decode(const std::vector<float>& table, float* dtable) {
         cf.free_(), c8.free_();
         cudaFree(dkv), cudaFree(q), cudaFree(r), cudaFree(s), cudaFree(out), cudaFree(work);
     }
+    bench_long_decode(dtable);
 }
 
 }  // namespace
