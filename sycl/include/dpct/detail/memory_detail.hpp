@@ -9,6 +9,8 @@
 #ifndef __DPCT_DETAIL_MEMORY_DETAIL_HPP__
 #define __DPCT_DETAIL_MEMORY_DETAIL_HPP__
 
+#include "../vram_tracker.hpp"  // vram_note / vram_drop, used below
+
 namespace dpct {
 
 #ifdef SYCL_EXT_ONEAPI_BINDLESS_IMAGES
@@ -186,11 +188,12 @@ public:
   using pointer_t = T *;
 };
 
+
 static inline void *dpct_malloc(size_t size, sycl::queue &q) {
 #ifdef DPCT_USM_LEVEL_NONE
   return mem_mgr::instance().mem_alloc(size * sizeof(byte_t));
 #else
-  return sycl::malloc_device(size, q.get_device(), q.get_context());
+  return vram_note(sycl::malloc_device(size, q.get_device(), q.get_context()), size);
 #endif // DPCT_USM_LEVEL_NONE
 }
 
@@ -763,6 +766,7 @@ inline void dpct_free(void *ptr, const sycl::queue &q) {
 #ifdef DPCT_USM_LEVEL_NONE
     detail::mem_mgr::instance().mem_free(ptr);
 #else
+    vram_drop(ptr);
     sycl::free(ptr, q.get_context());
 #endif // DPCT_USM_LEVEL_NONE
   }

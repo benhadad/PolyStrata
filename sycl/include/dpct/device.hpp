@@ -9,6 +9,7 @@
 #ifndef __DPCT_DEVICE_HPP__
 #define __DPCT_DEVICE_HPP__
 
+#include "vram_tracker.hpp"
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -533,8 +534,14 @@ public:
   void get_memory_info(size_t &free_memory, size_t &total_memory) {
 #if (defined(__SYCL_COMPILER_VERSION) && __SYCL_COMPILER_VERSION >= 20221105)
     if (!has(sycl::aspect::ext_intel_free_memory)) {
-      std::cerr << "get_memory_info: ext_intel_free_memory is not supported." << std::endl;
-      free_memory = 0;
+      if (detail::vram_tracker().on.load()) {   // SYCL port (strata-poly): total less what dpct allocated
+        const size_t tot = get_device_info().get_global_mem_size();
+        const size_t used = detail::vram_tracker().bytes.load();
+        free_memory = tot > used ? tot - used : 0;
+      } else {
+        std::cerr << "get_memory_info: ext_intel_free_memory is not supported." << std::endl;
+        free_memory = 0;
+      }
     } else {
       free_memory = get_info<sycl::ext::intel::info::device::free_memory>();
     }
