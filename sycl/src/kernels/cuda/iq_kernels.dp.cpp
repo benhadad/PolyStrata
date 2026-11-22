@@ -728,6 +728,53 @@ __dpct_inline__ float vec_dot_q8_0_q8_1(const void *__restrict__ vbq,
     return d8_0 * d8_1 * ((float) sumi);
 }
 
+// = get_int_from_table_16(aux, kvalues_fp4) without the table in global memory: the low nibbles of aux's four bytes
+// (x) and the high nibbles (y), each looked up in the E2M1 values doubled {0,1,2,3,4,6,8,12, then negated}.
+__dpct_inline__ sycl::int2 fp4_pair(int aux) {
+    const uint32_t a = (uint32_t) aux;
+    uint32_t lo = 0, hi = 0;
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const uint32_t byte = (a >> (8 * b)) & 0xFF;
+        const uint32_t cl = byte & 0xF, ch = byte >> 4;
+        const int ml = cl & 7, mh = ch & 7;
+        const int vl = ml < 5 ? ml : (ml == 5 ? 6 : (ml == 6 ? 8 : 12));
+        const int vh = mh < 5 ? mh : (mh == 5 ? 6 : (mh == 6 ? 8 : 12));
+        const int sl = (cl & 8) ? -vl : vl, sh = (ch & 8) ? -vh : vh;
+        lo |= ((uint32_t) (uint8_t) (int8_t) sl) << (8 * b);
+        hi |= ((uint32_t) (uint8_t) (int8_t) sh) << (8 * b);
+    }
+    return sycl::int2((int) lo, (int) hi);
+}
+// NVFP4 (ModelOpt): 64 values = 4 sub-blocks of 16, one UE4M3 scale each, E2M1 codes split-half like Q4_0.
+// kvalues_fp4 holds the E2M1 values doubled, so the scale is halved here (ggml's ue4m3_to_fp32, in software).
+__dpct_inline__ float ue4m3_to_f32_half(uint8_t x) {
+    x &= 0x7F;   // UE4M3 has no sign bit; a stray bit 7 must not dodge the NaN (0x7F) guard
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const uint32_t exp = (x >> 3) & 0xF, man = x & 0x7;
+    return exp == 0 ? (float) man * 0.0009765625f : sycl::bit_cast<float>(((exp + 119u) << 23) | (man << 20));
+}
+// One call = two sub-blocks (32 values); `bq8_1` is the block's first q8_1 block (two per 64 values).
+__dpct_inline__ float vec_dot_nvfp4_q8_1(const void *__restrict__ vbq, const block_q8_1 *__restrict__ bq8_1,
+                                         const int &kbx, const int &iqs) {
+    const block_nvfp4* bq4 = (const block_nvfp4*) vbq + kbx;
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int iqs0 = iqs + 2 * i, iqs1 = iqs0 + 1, is = iqs0 >> 1;
+        const sycl::int2 v0 = fp4_pair(get_int_b4(bq4->qs, iqs0));
+        const sycl::int2 v1 = fp4_pair(get_int_b4(bq4->qs, iqs1));
+        const block_q8_1* bq8 = bq8_1 + (is >> 1);
+        const int i8 = (is & 1) << 2;
+        int sumi = ggml_cuda_dp4a(v0.x(), get_int_b4(bq8->qs, i8 + 0), 0);
+        sumi = ggml_cuda_dp4a(v0.y(), get_int_b4(bq8->qs, i8 + 2), sumi);
+        sumi = ggml_cuda_dp4a(v1.x(), get_int_b4(bq8->qs, i8 + 1), sumi);
+        sumi = ggml_cuda_dp4a(v1.y(), get_int_b4(bq8->qs, i8 + 3), sumi);
+        sum += ue4m3_to_f32_half(bq4->d[is]) * bq8->ds[0] * (float) sumi;
+    }
+    return sum;
+}
+
 // ---------------------------------------------------------------- the formats
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
 template<int TY> 
@@ -748,6 +795,8 @@ template<> struct Fmt<22> { static constexpr int qk = 256, ipb = 8, step = 2;
     static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq2_s_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<29> { static constexpr int qk = 256, ipb = 8, step = 1;
     static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_m_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;   // NVFP4: 2 calls of 32 values
+    static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = QI4_K / VDR_Q4_K, step = VDR_Q4_K;
@@ -775,7 +824,7 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8)
 #endif
 #define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8)
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8)
+#define STRATA_MMVQ_FMTS(X) X(40) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8)
 
 __dpct_inline__ float warp_sum(float v) {
 #pragma unroll
@@ -4469,6 +4518,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
+        case 40: return (size_t) (n / 64) * sizeof(block_nvfp4);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
