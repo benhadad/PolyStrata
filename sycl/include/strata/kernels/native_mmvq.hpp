@@ -41,6 +41,10 @@ bool native_mmvq_multi_exact();
 // not reconstruct that sum from the quantized integers.
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
                           void* stream);
+/// SYCL port (poly_shims.cpp): rms norm + Q8_1 quantize of its output; `add` must be null.
+void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float* y, void* y_q8_1, int n, int rows,
+                              float eps, int threads, void* stream);
+
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream);
@@ -148,5 +152,60 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream);
+
+
+// SYCL port: declarations as upstream; poly_shims.cpp defines them as 'no kernel' (callers fall back).
+// Up to kMmvqSlotsMax (32) matrices of one format and shape in one launch: matrix i times its own Q8_1 column x[i]
+// into y[i], as native_mmvq(type, w[i], x[i], y[i], n_in, n_out, 1, stream) would each.  A launch costs the calling thread more
+// than a small product costs the card, which is what this saves.  False, with nothing launched: there is no
+// kernel for it (a format native_mmvq() does not take, or a HIP build), and the caller launches them one by one.
+constexpr int kMmvqSlotsMax = 32;   // 8 before: strata-poly's cached experts go 32 a launch where the wide path is on
+struct MmvqSlots {
+    const void* w[kMmvqSlotsMax];
+    const void* x[kMmvqSlotsMax];
+    float* y[kMmvqSlotsMax];
+    // The same bits through other kernels: native_mmvq.cu's formats a warp a row instead of a block of WARPS warps
+    // (lane l with the terms of the block's threads l, 32 + l, ..., added in the block's order), where the block's
+    // threads had uneven work; the IQ formats whose grid iq_kernels.cu stages in shared memory (IQ1_S, IQ1_M, IQ2_XXS,
+    // IQ2_XS, IQ2_S), 8 rows a warp with the grid staged once.  The other IQ formats' launches are as without it.
+    // Faster for Inkling 2's experts on an RTX 2070 Super; measured on CUDA only.  It takes precedence over
+    // native_mmvq_slots_wide() (on by default on HIP); Metal takes no notice.
+    bool lanes = false;
+};
+bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream);
+// Whether the slots launches take a warp per row group where a row's blocks fit one warp (an expert's IQ4_XS down
+// projection of 512 values), and strata-poly gives them its cached experts 32 at a time instead of 8.  The same bits
+// either way.  On by default on HIP (measured on an RX 7800 XT), off by default on CUDA (not measured there);
+// STRATA_SLOTS_WARP=0 turns it off, =1 on.
+bool native_mmvq_slots_wide();
+// native_mmvq_slots with the matrices the card picked, so that the launch needs nothing of the host (a decode
+// step's routed experts when every one of them is in VRAM): matrix j is table[ids[j]] + offset bytes, times the
+// Q8_1 column x + (j / x_every) * x_stride bytes, into y + j * y_stride floats.  count may pass 8.  False, with
+// nothing launched: there is no kernel for the format (native_mmvq_ids_supported() says so beforehand).
+struct MmvqIds {
+    const void* const* table;
+    const int32_t* ids;
+    std::size_t offset;
+    const void* x;
+    std::size_t x_stride;
+    int x_every;
+    float* y;
+    std::size_t y_stride;
+    bool lanes = false;   // as MmvqSlots::lanes
+};
+bool native_mmvq_ids_supported(int ggml_type);
+bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);
+// Several matrices of one format and input width in one launch (an attention's projections of the same input), each
+// with its own rows, Q8_1 columns and output: native_mmvq(type, w[i], x[i], y[i], n_in, n_out[i], ncols, stream)
+// for each, bit for bit.  Q8_0, Q4_K, Q5_K and Q6_K.  False, with nothing launched: another format, a repacked
+// matrix, or a layout the switches above chose whose bits these are not; the caller launches them one by one.
+constexpr int kMmvqJobsMax = 8;
+struct MmvqJobs {
+    const void* w[kMmvqJobsMax];
+    const void* x[kMmvqJobsMax];
+    float* y[kMmvqJobsMax];
+    int n_out[kMmvqJobsMax];
+};
+bool native_mmvq_jobs(int ggml_type, const MmvqJobs& jobs, int count, int n_in, int ncols, void* stream);
 
 } // namespace strata::kernels
