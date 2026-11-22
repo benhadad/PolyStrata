@@ -405,3 +405,23 @@ if(STRATA_SYCL_PARITY)
     target_link_libraries(kq_cpu_bench PRIVATE strata_kernels_cpu)
   endif()
 endif()
+
+# --- strata-poly (Inkling 2 only): the poly engine, migrated with dpct (sycl/tools + poly_fixups) ------------------
+option(STRATA_SYCL_POLY "Build strata-poly (the poly engine; Inkling 2 only in this port)" OFF)
+if(STRATA_SYCL_POLY AND STRATA_NATIVE_EXPERTS)
+  if(STRATA_GGML_DIR)
+    set(_poly_gg ${STRATA_GGML_DIR}/ggml)
+  else()
+    set(_poly_gg ${strata_llamacpp_SOURCE_DIR}/ggml)
+  endif()
+  strata_resolve(_poly src/poly/kernels.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu
+                       src/poly/engine.cpp src/poly/inkling.cpp src/poly/spill.cpp src/poly/main.cpp)
+  list(APPEND _poly ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/mmq_stub.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/poly_shims.cpp
+       ${STRATA_ROOT}/src/poly/cpu_experts.cpp ${STRATA_ROOT}/src/poly/cpu_lowbit.cpp)
+  set_source_files_properties(${STRATA_ROOT}/src/poly/cpu_lowbit.cpp PROPERTIES INCLUDE_DIRECTORIES ${_poly_gg}/src)
+  add_executable(strata-poly ${_poly})
+  target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/poly ${STRATA_ROOT}/src/poly ${STRATA_ROOT}/src ${_poly_gg}/include ${_poly_gg}/src)
+  target_compile_options(strata-poly PRIVATE -qmkl=sequential)
+  target_link_options(strata-poly PRIVATE -qmkl=sequential)
+  target_link_libraries(strata-poly PRIVATE strata_engine strata_kernels strata_spec ggml-cpu ggml-base Threads::Threads)
+endif()
