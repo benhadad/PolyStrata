@@ -3321,6 +3321,14 @@ void Engine::alloc() {
     h_cpu_ = (float*) hmalloc(n * n_embd_ * sizeof(float), "pinned memory");
     h_logits_ = (float*) hmalloc((size_t) n_vocab_ * sizeof(float), "pinned memory");
 
+    if (!mmq_ && opt_.gpu_experts) {
+        // This port has no MMQ tiles (Mmq is a stub), so the block below is skipped, but the routing on the card
+        // (card_moe() / moe_card(), native_mmvq_ids) needs only these three.  Without them every visit waited for the host.
+        const size_t rr = n * n_used_;
+        d_ids_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
+        d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
+        d_slots_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
+    }
     if (mmq_) {
         const size_t rr = n * n_used_,
                      tab = (3 * rr + 3 * (size_t) n_expert_ + 3 + kClasses * ((size_t) n_expert_ + 1) +
