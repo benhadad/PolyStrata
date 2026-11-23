@@ -622,6 +622,8 @@ protected:
     /// A write into VRAM, on st_.  Every one of them goes through these two or is an async call on a stream of
     /// its own: see the note on h2d() in engine.cpp.
     void h2d(void* dst, const void* src, size_t bytes);
+    /// h2d() for a host buffer that dies (or is reused) when the caller returns: the copy has run when this does.
+    void h2d_copy(void* dst, const void* src, size_t bytes);
     void zero_vram(void* dst, size_t bytes);
     /// An attention cache for alloc_caches(): `bytes` for every `per` rows, with addresses for the whole context
     /// and VRAM for the rows the sequence has reached (cover()).

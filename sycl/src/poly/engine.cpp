@@ -829,6 +829,16 @@ void Engine::h2d(void* dst, const void* src, size_t bytes) {
     }
 }
 
+// SYCL port: CUDA's cudaMemcpyAsync from pageable memory is staged by the driver, so the host buffer may be reused
+// the moment it returns.  A SYCL memcpy reads the host buffer when the queue gets to it, behind whatever expert
+// copies are queued before it, so a buffer that dies on return (a std::vector in upload(), the loop's queries)
+// was read after it was freed and reused.  Callers with such a buffer use this.
+void Engine::h2d_copy(void* dst, const void* src, size_t bytes) {
+    ck(DPCT_CHECK_ERROR(cs(st_)->memcpy(dst, src, bytes)), "a copy into VRAM");
+    ck(DPCT_CHECK_ERROR(cs(st_)->wait_and_throw()), "a copy into VRAM");
+    h2d_queued_ = 0;
+}
+
 void Engine::zero_vram(void* dst, size_t bytes) {
     // SYCL port: a multi-GB memset is one long GPU job, and the WSL2 GPU watchdog (TDR) kills it (DEVICE_LOST).
     // Zero in 256 MiB pieces, each waited for.
@@ -1786,7 +1796,7 @@ Dev Engine::upload_as(const TensorInfo* t, const std::string& name, int64_t n_in
                                     (int64_t) (b - a), n_in, nullptr);
             });
         }
-        h2d(d.p, q.data(), out);
+        h2d_copy(d.p, q.data(), out);
 #if defined(STRATA_GPU_METAL)
         if (opt_.metal_balanced) drop_file_pages(src, bytes);
 #endif
@@ -1820,12 +1830,12 @@ Dev Engine::upload_as(const TensorInfo* t, const std::string& name, int64_t n_in
     if (fix)
         for (float& v : f) v = fix(v);
     if (type == kTypeF32) {
-        h2d(d.p, f.data(), out);
+        h2d_copy(d.p, f.data(), out);
         return d;
     }
     std::vector<ggml_bf16_t> h(count);
     ggml_fp32_to_bf16_row(f.data(), h.data(), (int64_t) count);
-    h2d(d.p, h.data(), out);
+    h2d_copy(d.p, h.data(), out);
     return d;
 }
 
