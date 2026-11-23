@@ -34,6 +34,7 @@
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "s26_tsum.dp.hpp"
+#include "slots.dp.hpp"        // SlotPtrs (the slots / ids launches)
 
 #include <algorithm>
 #include <cstdint>
@@ -3012,6 +3013,301 @@ Q6Planar q6_planar_make(void* dev, std::size_t nb, int n_in, int n_out) {
     auto* base = static_cast<uint8_t*>(dev);
     return Q6Planar{dev, base, base + l.o_qh, base + l.o_sc, reinterpret_cast<const sycl::half*>(base + l.o_d), n_in, n_out};
 }
+
+// ---- several matrices in one launch (native_mmvq_slots / _ids), re-migrated from the current CUDA source
+// Several matrices of one format and shape in one launch (native_mmvq_slots, native_mmvq_ids): blockIdx.y is the
+// matrix, and the rest is native_mmvq_multi_kernel for one column in its EXACT layout.
+template <typename F, int ROWS, typename S>
+__dpct_inline__ void native_mmvq_slots_kernel(S slots, int n_in, int n_out) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const SlotPtrs at = slot_ptrs(slots, int(item_ct1.get_group(1)));
+    const auto* w = static_cast<const typename F::Block*>(at.w);
+    const auto* x = static_cast<const Q81Block*>(at.x);
+    float* y = at.y;
+    const int tid =
+        WARP * int(item_ct1.get_local_id(1)) + int(item_ct1.get_local_id(2));
+    const int row0 = ROWS * int(item_ct1.get_group(2));
+    const int blocks_per_row = n_in / F::DIV;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+        const int kby = kbx * F::KBY;
+        const int kqs = F::kqs(tid);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                /*
+                DPCT1084: The function call "SmallTraits::load" has multiple
+                migration results in different template instantiations that
+                could not be unified. You may need to adjust the code.
+                */
+                tmp[i] += F::apply(F::load(w + block, kqs), x + kby, kqs);
+            }
+        }
+    }
+    auto &partial = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[WARPS - 1][ROWS][WARP]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    if (item_ct1.get_local_id(1) > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i)
+            partial[item_ct1.get_local_id(1) - 1][i][item_ct1.get_local_id(2)] =
+                tmp[i];
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    if (item_ct1.get_local_id(1) > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] +=
+            partial[l][i][item_ct1.get_local_id(2)];
+        tmp[i] = warp_sum(tmp[i]);
+        if (item_ct1.get_local_id(2) == i && row0 + i < n_out) y[row0 + i] =
+            tmp[i];
+    }
+}
+
+// native_mmvq_slots_kernel when a row's blocks all fall to the first warp's lanes (blocks_per_row * T <= WARP, e.g. an
+// expert's IQ4_XS down projection of 512 values: 2 blocks, 16 lanes): there the other warps only add zeros, so each
+// warp takes rows of its own instead - the same lanes' terms, the same three zero partials and the same warp_sum,
+// bit for bit, with a quarter of the blocks and no shared memory or barrier.  Qwen3.6 UD-Q3_K_M on an RX 7800 XT:
+// the down products were 32% of a decode's GPU time at ~75 GB/s.  Taken where native_mmvq_slots_wide() says so.
+template <typename F, int ROWS, typename S, int G = 1>
+__dpct_inline__ void native_mmvq_slots_warp_kernel(S slots, int n_in,
+                                                   int n_out) {
+    // G row groups a warp, WARP / G lanes each (G = 2 when a row needs 16 lanes or fewer: the IQ4_XS down projection's
+    // 512 values are 16): the full warp_sum's steps between the groups added the zeros of the lanes that had none of
+    // the row, so a group adds those zeros and sums its own lanes - the same bits again
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int L = WARP / G;
+    const SlotPtrs at = slot_ptrs(slots, int(item_ct1.get_group(1)));
+    const auto* w = static_cast<const typename F::Block*>(at.w);
+    const auto* x = static_cast<const Q81Block*>(at.x);
+    float* y = at.y;
+    const int lane = int(item_ct1.get_local_id(2)), grp = lane / L,
+              local = lane - grp * L;
+    const int warp_row0 =
+        ROWS *
+        (int(item_ct1.get_group(2)) * WARPS + int(item_ct1.get_local_id(1))) *
+        G;
+    if (warp_row0 >= n_out) return;   // whole warps: no barrier below
+    const int row0 = warp_row0 + ROWS * grp;
+    const int blocks_per_row = n_in / F::DIV;
+    float tmp[ROWS] = {};
+    if (row0 < n_out) {
+        for (int kbx = local / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+            const int kby = kbx * F::KBY;
+            const int kqs = F::kqs(local);
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+                    const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                    /*
+                    DPCT1084: The function call "SmallTraits::load" has
+                    multiple migration results in different template
+                    instantiations that could not be unified. You may need to
+                    adjust the code.
+                    */
+                    tmp[i] += F::apply(F::load(w + block, kqs), x + kby, kqs);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += 0.0f;   // the block kernel's partials of the other warps
+        if constexpr (G == 1) {
+            tmp[i] = warp_sum(tmp[i]);
+        } else {
+#pragma unroll
+            for (int offset = WARP / 2; offset >= L; offset >>= 1) tmp[i] += 0.0f;   // the other group's lanes: zeros
+#pragma unroll
+            /*
+            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
+            feature masked sub_group function which may not be supported by all
+            compilers or runtimes. You may need to adjust the code.
+            */
+            for (int offset = L / 2; offset > 0; offset >>= 1) tmp[i] +=
+                dpct::experimental::permute_sub_group_by_xor(
+                    0xffffffff,
+                    sycl::ext::oneapi::this_work_item::get_sub_group(), tmp[i],
+                    offset);
+        }
+        if (local == i && row0 + i < n_out) y[row0 + i] = tmp[i];
+    }
+}
+
+// native_mmvq_slots_kernel<F, 1> with a warp a row (MmvqSlots::lanes): lane l does the work of the block's threads l,
+// 32 + l, 64 + l and 96 + l, each into its own sum, and adds them in the order the block adds its warps' partials -
+// the same terms in the same order, so the same bits, with no shared memory or barrier and no thread idle for a K
+// the block's threads do not divide evenly (an expert's 2304 and 1152 IQ4_NL values: 72 and 36 blocks for the
+// block's 64 pairs of threads).
+template <typename F, typename S>
+__dpct_inline__ void native_mmvq_slots_lanes_kernel(S slots, int n_in,
+                                                    int n_out) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const SlotPtrs at = slot_ptrs(slots, int(item_ct1.get_group(1)));
+    const int row =
+        int(item_ct1.get_group(2)) * WARPS + int(item_ct1.get_local_id(1));
+    if (row >= n_out) return;   // whole warps: no barrier below
+    const auto* w = static_cast<const typename F::Block*>(at.w) + std::size_t(row) * (n_in / F::DIV);
+    const auto* x = static_cast<const Q81Block*>(at.x);
+    const int lane = int(item_ct1.get_local_id(2)),
+              blocks_per_row = n_in / F::DIV;
+    float tmp[WARPS] = {};
+    for (int base = 0; base < blocks_per_row; base += F::BPI) {
+#pragma unroll
+        for (int v = 0; v < WARPS; ++v) {
+            const int tid = WARP * v + lane, kbx = base + tid / F::T, kqs = F::kqs(tid);
+            /*
+            DPCT1084: The function call "SmallTraits::load" has multiple
+            migration results in different template instantiations that could
+            not be unified. You may need to adjust the code.
+            */
+            if (kbx < blocks_per_row) tmp[v] +=
+                F::apply(F::load(w + kbx, kqs), x + kbx * F::KBY, kqs);
+        }
+    }
+#pragma unroll
+    for (int v = 1; v < WARPS; ++v) tmp[0] += tmp[v];
+    tmp[0] = warp_sum(tmp[0]);
+    if (lane == 0) at.y[row] = tmp[0];
+}
+
+template <typename F, typename S>
+void launch_slots(const S &slots, int count, int n_in, int n_out,
+                  dpct::queue_ptr s) {
+    const dpct::dim3 threads(WARP, WARPS);
+    if (slots.lanes) {
+        const dpct::dim3 blocks(
+            unsigned((std::size_t(n_out) + WARPS - 1) / WARPS),
+            unsigned(count));
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->parallel_for<dpct_kernel_name<
+                class native_mmvq_slots_lanes_kernel_ef5313, F, S>>(
+                sycl::nd_range<3>(blocks * threads, threads), exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_mmvq_slots_lanes_kernel<F, S>(slots, n_in,
+                                                             n_out);
+                    });
+        }
+        return;
+    }
+    if (native_mmvq_slots_wide() && n_in / F::DIV * F::T <= WARP && n_in % F::DIV == 0) {
+        constexpr int ROWS = 2;
+        if (n_in / F::DIV * F::T <= WARP / 2) {   // a row in half a warp: two rows' groups a warp
+            const dpct::dim3 blocks(
+                unsigned((std::size_t(n_out) + 2 * ROWS * WARPS - 1) /
+                         (2 * ROWS * WARPS)),
+                unsigned(count));
+            /*
+            DPCT1049: The work-group size passed to the SYCL kernel may
+            exceed the limit. To get the device limit, query
+            info::device::max_work_group_size. Adjust the work-group size if
+            needed.
+            */
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                s->parallel_for<dpct_kernel_name<
+                    class native_mmvq_slots_warp_kernel_53ea84, F,
+                    dpct_kernel_scalar<ROWS>, S, dpct_kernel_scalar<2>>>(
+                    sycl::nd_range<3>(blocks * threads, threads), exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_mmvq_slots_warp_kernel<F, ROWS, S, 2>(
+                                slots, n_in, n_out);
+                        });
+            }
+        } else {
+            const dpct::dim3 blocks(
+                unsigned((std::size_t(n_out) + ROWS * WARPS - 1) /
+                         (ROWS * WARPS)),
+                unsigned(count));
+            /*
+            DPCT1049: The work-group size passed to the SYCL kernel may
+            exceed the limit. To get the device limit, query
+            info::device::max_work_group_size. Adjust the work-group size if
+            needed.
+            */
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                s->parallel_for<dpct_kernel_name<
+                    class native_mmvq_slots_warp_kernel_e55163, F,
+                    dpct_kernel_scalar<ROWS>, S, dpct_kernel_scalar<1>>>(
+                    sycl::nd_range<3>(blocks * threads, threads), exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_mmvq_slots_warp_kernel<F, ROWS, S, 1>(
+                                slots, n_in, n_out);
+                        });
+            }
+        }
+        return;
+    }
+    if (n_in / F::DIV < F::BPI) {
+        constexpr int ROWS = 2;
+        const dpct::dim3 blocks(
+            unsigned((std::size_t(n_out) + ROWS - 1) / ROWS), unsigned(count));
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->parallel_for<
+                dpct_kernel_name<class native_mmvq_slots_kernel_c46680, F,
+                                 dpct_kernel_scalar<ROWS>, S>>(
+                sycl::nd_range<3>(blocks * threads, threads), exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_mmvq_slots_kernel<F, ROWS, S>(slots, n_in,
+                                                             n_out);
+                    });
+        }
+    } else {
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        s->parallel_for<dpct_kernel_name<class native_mmvq_slots_kernel_b6f4ee,
+                                         F, dpct_kernel_scalar<1>, S>>(
+            sycl::nd_range<3>(sycl::range(1, unsigned(count), unsigned(n_out)) *
+                                  threads,
+                              threads),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                native_mmvq_slots_kernel<F, 1, S>(slots, n_in, n_out);
+            });
+    }
+}
+
+
 } // namespace
 
 bool native_q8_0_packed_enabled() {
@@ -4088,5 +4384,251 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
 }
+
+
+// ---- native_mmvq_slots / native_mmvq_ids / native_mmvq_jobs (the CUDA source's, re-migrated; Q2_K and MXFP4 have no
+// ---- kernel in this port: slots_kind() says 0 and the callers launch those one by one)
+namespace {
+
+// The formats a slots launch has a kernel for: 1 this file's, 2 iq_kernels.cu's, 0 none.
+int slots_kind(int ggml_type) {
+#if defined(STRATA_HIP_GFX906)
+    (void) ggml_type;
+    return 0;   // the wave layout has no kernel for it
+#else
+    switch (ggml_type) {
+    case 2: case 6: case 8: case 20: case 11: case 12: case 13: case 14: case 23: case 42: return 1;
+    case 7: case 16: case 17: case 18: case 21: case 22: case 29: case 19: case 40: return 2;   // the ones native_mmvq() hands to iq_mmvq()
+    default: return 0;
+    }
+#endif
+}
+
+template<typename S>
+void launch_slots_of(int ggml_type, const S& slots, int count, int n_in, int n_out, void* stream) {
+    const bool small = ggml_type == 2 || ggml_type == 6 || ggml_type == 8 || ggml_type == 20;
+    validate_shape(n_in, 1, small || ggml_type == 7 ? 32 : ggml_type == 42 || ggml_type == 40 ? 64 : 256);
+    validate_stream(stream);
+    if (slots_kind(ggml_type) == 2) {
+        if constexpr (std::is_same_v<S, MmvqSlots>) iq_mmvq_slots(ggml_type, slots, count, n_in, n_out, stream);
+        else iq_mmvq_ids(ggml_type, slots, count, n_in, n_out, stream);
+        return;
+    }
+    const auto s = strata::q_of(stream);
+    switch (ggml_type) {
+    case 2: launch_slots<SmallTraits<Q40Block, 4>>(slots, count, n_in, n_out, s); break;
+    case 6: launch_slots<SmallTraits<Q50Block, 4>>(slots, count, n_in, n_out, s); break;
+    case 8: launch_slots<SmallTraits<Q80Block, 8>>(slots, count, n_in, n_out, s); break;
+    case 20: launch_slots<SmallTraits<IQ4NLBlock, 4>>(slots, count, n_in, n_out, s); break;
+    case 11: launch_slots<Q3KTraits>(slots, count, n_in, n_out, s); break;
+    case 12: launch_slots<Q4KTraits>(slots, count, n_in, n_out, s); break;
+    case 13: launch_slots<Q5KTraits>(slots, count, n_in, n_out, s); break;
+    case 14: launch_slots<Q6KTraits>(slots, count, n_in, n_out, s); break;
+    case 23: launch_slots<IQ4XSTraits>(slots, count, n_in, n_out, s); break;
+    default: launch_slots<Q20Traits>(slots, count, n_in, n_out, s); break;
+    }
+    launch_check();
+}
+
+}  // namespace
+
+bool native_mmvq_slots_wide() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SLOTS_WARP");
+#if defined(__HIPCC__)
+        return v == nullptr || v[0] != '0';
+#else
+        return v != nullptr && v[0] == '1';
+#endif
+    }();
+    return on;
+}
+
+bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream) {
+    if (!slots_kind(ggml_type)) return false;
+    if (n_out <= 0 || count < 1 || count > kMmvqSlotsMax)
+        throw std::invalid_argument("native MMVQ requires n_out > 0 and 1 to 32 matrices");
+    for (int i = 0; i < count; ++i) {
+        validate_pointer(slots.w[i]);
+        validate_pointer(slots.x[i]);
+        validate_pointer(slots.y[i]);
+    }
+    launch_slots_of(ggml_type, slots, count, n_in, n_out, stream);
+    return true;
+}
+
+namespace {
+
+// native_mmvq_jobs: blockIdx.x counts the row blocks of all the matrices, matrix after matrix, and a block is
+// native_mmvq_multi_kernel's EXACT layout for its matrix (one row, or ROWS for a K too small for every thread).  A
+// kernel of its own rather than a matrix table in native_mmvq_multi_kernel, which every family's products run: that
+// kernel stays byte-identical.  An ordinary launch: it has no pdl_wait() for launch_pdl().
+struct JobsArgs {
+    MmvqJobs j;
+    int first[kMmvqJobsMax + 1];   // each matrix's first row block, and the end
+    int count;
+};
+
+template <typename F, int NCOLS, int ROWS>
+/*
+DPCT1110: The total declared local variable size in device function
+native_mmvq_jobs_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void native_mmvq_jobs_kernel(JobsArgs a, int n_in) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int b = int(item_ct1.get_group(2));
+    int k = 0;
+#pragma unroll
+    for (int i = 1; i < kMmvqJobsMax; ++i)
+        if (i < a.count && b >= a.first[i]) k = i;
+    const auto* w = static_cast<const typename F::Block*>(a.j.w[k]);
+    const auto* x = static_cast<const Q81Block*>(a.j.x[k]);
+    float* y = a.j.y[k];
+    const int n_out = a.j.n_out[k];
+    const int tid =
+        WARP * int(item_ct1.get_local_id(1)) + int(item_ct1.get_local_id(2));
+    const int row0 = ROWS * (b - a.first[k]);
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    float tmp[NCOLS][ROWS] = {};
+    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+        const int kby = kbx * F::KBY;
+        const int kqs = F::kqs(tid);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const typename F::W wv = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+            }
+        }
+    }
+    auto &partial = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[WARPS - 1][NCOLS][ROWS][WARP]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    if (item_ct1.get_local_id(1) > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i)
+                partial[item_ct1.get_local_id(1) - 1][j][i]
+                       [item_ct1.get_local_id(2)] = tmp[j][i];
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    if (item_ct1.get_local_id(1) > 0) return;
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < WARPS - 1; ++l) tmp[j][i] +=
+                partial[l][j][i][item_ct1.get_local_id(2)];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (item_ct1.get_local_id(2) == i && row0 + i < n_out)
+                y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
+    }
+}
+
+template <typename F, int NCOLS>
+void launch_jobs_n(JobsArgs a, int n_in, dpct::queue_ptr s) {
+    const auto go = [&](auto rows) {
+        constexpr int ROWS = decltype(rows)::value;
+        a.first[0] = 0;
+#pragma unroll
+        for (int i = 0; i < a.count; ++i)
+            a.first[i + 1] = a.first[i] + (a.j.n_out[i] + ROWS - 1) / ROWS;
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->parallel_for<dpct_kernel_name<
+                class native_mmvq_jobs_kernel_cb74de, F,
+                dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<ROWS>>>(
+                sycl::nd_range<3>(
+                    sycl::range(1, 1, unsigned(a.first[a.count])) *
+                        sycl::range(1, WARPS, WARP),
+                    sycl::range(1, WARPS, WARP)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_mmvq_jobs_kernel<F, NCOLS, ROWS>(a, n_in);
+                    });
+        }
+    };
+    if (n_in / F::DIV >= F::BPI) go(std::integral_constant<int, 1>{});
+    else go(std::integral_constant<int, 2>{});
+}
+
+template <typename F>
+void launch_jobs(const JobsArgs &a, int n_in, int ncols, dpct::queue_ptr s) {
+    switch (ncols) {
+        case 1: launch_jobs_n<F, 1>(a, n_in, s); break;
+        case 2: launch_jobs_n<F, 2>(a, n_in, s); break;
+        case 3: launch_jobs_n<F, 3>(a, n_in, s); break;
+        case 4: launch_jobs_n<F, 4>(a, n_in, s); break;
+        case 5: launch_jobs_n<F, 5>(a, n_in, s); break;
+        case 6: launch_jobs_n<F, 6>(a, n_in, s); break;
+        case 7: launch_jobs_n<F, 7>(a, n_in, s); break;
+        default: launch_jobs_n<F, 8>(a, n_in, s); break;
+    }
+}
+
+}  // namespace
+
+bool native_mmvq_jobs(int ggml_type, const MmvqJobs& jobs, int count, int n_in, int ncols, void* stream) {
+#if defined(STRATA_HIP_GFX906)
+    (void) ggml_type, (void) jobs, (void) count, (void) n_in, (void) ncols, (void) stream;
+    return false;   // the wave layout's bits are other
+#else
+    // the formats whose single products are this layout's bits; several columns only in the exact layout
+    if (ggml_type != 8 && ggml_type != 12 && ggml_type != 13 && ggml_type != 14) return false;
+    if (ncols > 1 && (!g_multi_exact || s26_tsum_on())) return false;
+    if (count < 1 || count > kMmvqJobsMax || ncols < 1 || ncols > MAX_NCOLS)
+        throw std::invalid_argument("native_mmvq_jobs requires 1 to 8 matrices and 1 to 8 columns");
+    validate_shape(n_in, ncols, ggml_type == 8 ? 32 : 256);
+    validate_stream(stream);
+    JobsArgs a{};
+    a.j = jobs;
+    a.count = count;
+    for (int i = 0; i < count; ++i) {
+        if (jobs.n_out[i] <= 0) throw std::invalid_argument("native_mmvq_jobs requires n_out > 0");
+        validate_pointer(jobs.w[i]);
+        validate_pointer(jobs.x[i]);
+        validate_pointer(jobs.y[i]);
+    }
+    const auto s = strata::q_of(stream);
+    switch (ggml_type) {
+    case 8: launch_jobs<SmallTraits<Q80Block, 8>>(a, n_in, ncols, s); break;
+    case 12: launch_jobs<Q4KTraits>(a, n_in, ncols, s); break;
+    case 13: launch_jobs<Q5KTraits>(a, n_in, ncols, s); break;
+    default: launch_jobs<Q6KTraits>(a, n_in, ncols, s); break;
+    }
+    launch_check();
+    return true;
+#endif
+}
+
+bool native_mmvq_ids_supported(int ggml_type) { return slots_kind(ggml_type) != 0; }
+
+bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream) {
+    if (!slots_kind(ggml_type)) return false;
+    if (n_out <= 0 || count < 1 || count > 65535 || ids.x_every < 1)
+        throw std::invalid_argument("native_mmvq_ids requires n_out > 0, 1 to 65535 matrices and x_every > 0");
+    validate_pointer(ids.table);
+    validate_pointer(ids.ids);
+    validate_pointer(ids.x);
+    validate_pointer(ids.y);
+    launch_slots_of(ggml_type, ids, count, n_in, n_out, stream);
+    return true;
+}
+
 
 } // namespace strata::kernels

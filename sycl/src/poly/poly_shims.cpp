@@ -14,11 +14,4 @@ void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float*
     strata::poly::rms_norm(x, w, y, n, rows, eps, stream);
     native_quantize_q8_1(y, y_q8_1, n, rows, stream);
 }
-// The multi-matrix fast paths are not ported yet: false, with nothing launched, is their contract, and the engine
-// then launches the matrices one by one.
-bool native_mmvq_slots(int, const MmvqSlots&, int, int, int, void*) { return false; }
-bool native_mmvq_slots_wide() { return false; }
-bool native_mmvq_ids_supported(int) { return false; }
-bool native_mmvq_ids(int, const MmvqIds&, int, int, int, void*) { return false; }
-bool native_mmvq_jobs(int, const MmvqJobs&, int, int, int, void*) { return false; }
 }  // namespace strata::kernels
