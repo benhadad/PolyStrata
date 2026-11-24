@@ -3772,6 +3772,16 @@ bool Engine::input(int32_t token, int64_t row, float* dst) const {
     return false;
 }
 
+// --dump-tensors: one file of n floats, in the files ref_dump writes for llama.cpp (int64 ne[4], then float32 values)
+static void write_tensor(const std::string& dir, const std::string& file, const float* v, int64_t n) {
+    std::FILE* f = std::fopen((dir + "/" + file + ".bin").c_str(), "wb");
+    if (!f) throw std::runtime_error("--dump-tensors: cannot write " + dir + "/" + file + ".bin");
+    const int64_t ne[4] = {n, 1, 1, 1};
+    std::fwrite(ne, sizeof(ne), 1, f);
+    std::fwrite(v, sizeof(float), (size_t) n, f);
+    std::fclose(f);
+}
+
 void Engine::dbg(const char* name, int il, const float* dev, int n) {
     if (!opt_.dump) return;
     std::vector<float> h((size_t) n);
@@ -3787,6 +3797,11 @@ void Engine::dbg(const char* name, int il, const float* dev, int n) {
     }
     std::fprintf(stderr, "dump pos=%lld blk=%d %-8s n=%d sum=%.6f abs=%.6f first=%.6f %.6f %.6f\n", (long long) pos_,
                  il, name, n, sum, abs, h[0], h[1], h[2]);
+    // llama.cpp's names: <name>-<index of the visit>, and result_norm without one; one file a token (a position)
+    if (!opt_.dump_dir.empty())
+        write_tensor(opt_.dump_dir,
+                     "p" + std::to_string((long long) pos_) + "_" + name + (il >= 0 ? "-" + std::to_string(il) : std::string()),
+                     h.data(), n);
 }
 
 // y = w x for n tokens.  xq is x already in Q8_1, when the caller has it.  rows_per_x below n_out gives each group
@@ -5971,6 +5986,9 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
             tail();
         }
         if (want_logits) ck(DPCT_CHECK_ERROR(cs(st_)->wait()), "eval");
+        // --dump-tensors: the logits of the last token of this call (the padded vocabulary's are -inf)
+        if (want_logits && !opt_.dump_dir.empty())
+            write_tensor(opt_.dump_dir, "p" + std::to_string((long long) pos_ + n - 1) + "_logits", h_logits_, n_vocab_);
     }
     // behind the logits: the caller has them while the card does this
     if (draft_) draft_rows(tokens, ahead_pos_ == pos_ && tokens[0] == ahead_tok_ ? 1 : 0, n);

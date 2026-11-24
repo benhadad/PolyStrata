@@ -1641,6 +1641,11 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-min-tokens") cache.o.park_min = std::atoll(val());
         else if (a == "--conversation-cache-min-free-mib") cache.min_free_mib = std::atoll(val());
         else if (a == "--dump-layers") o.dump = true;
+        else if (a == "--dump-tensors") {   // --dump-layers, and every stage's values in files (see tools/ref_compare.py)
+            o.dump = true;
+            o.dump_dir = val();
+            std::filesystem::create_directories(o.dump_dir);
+        }
         else if (a == "--images") images = val();
         else if (a == "--image-pad") image_pad = std::atoi(val());
         else if (a == "--top-probs") top_probs = std::atoi(val());
