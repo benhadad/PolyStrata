@@ -2,8 +2,8 @@
 // native_mmvq(type, w, x, y, n_in, n_out, 1) for each matrix, which is their documented contract (native_mmvq.hpp).
 // Formats: the ones Inkling 2 Mini's experts use (NVFP4 and the K / IQ quants that go to iq_mmvq) plus Q8_0.
 // Weights are random bytes.  A case passes when every finite output is bit-equal, or (for formats whose single-column
-// kernel adds the terms in another order than the slots kernels) the largest difference is under 1e-4 of the largest
-// output; NaN / Inf outputs are compared by class, because a NaN's payload depends on the order of the operations.
+// kernel adds the terms in another order than the slots kernels) in every matrix the largest difference is under 1e-4 of
+// that matrix's largest output; NaN / Inf outputs are compared by class, because a NaN's payload depends on the order of the operations.
 // A case where more than half of the reference outputs are not finite (random FP16 scales overflow float) is SKIPPED:
 // there a finite-vs-infinite flip at the overflow edge says nothing about the kernels.
 #include <sycl/sycl.hpp>
@@ -28,19 +28,25 @@ static const Fmt kFmts[] = {
 
 // Finite values must match bit for bit.  Random weight bytes give NaN / infinite outputs (random FP16 scales), and a NaN's
 // sign and payload depend on the order of the operations that made it, so those are compared by class (NaN, +inf, -inf).
-static double g_maxdiff = 0, g_scale = 0;   // largest |a-b| over the not-bit-equal finite pairs; largest finite |a|
+// g_rel: for each matrix (one launch's n_out outputs), the largest |a-b| over its not-bit-equal finite pairs divided by that
+// matrix's own largest finite |a|, then the largest of those.  A scale per matrix, not per batch: random FP16 scales make
+// some matrices' outputs huge, and a batch-wide scale would let a wrong small output of another matrix pass.
+static double g_rel = 0;
 static long g_notbit = 0, g_badclass = 0;    // finite pairs not bit-equal; pairs whose class (finite / NaN / Inf) differs
 static int g_skipped = 0;                    // cases skipped because the random weights overflow
-static bool same_bits(const std::vector<float>& a, const std::vector<float>& b, long& nonfinite, long& finite) {
+static bool same_bits(const std::vector<float>& a, const std::vector<float>& b, size_t n_out, long& nonfinite, long& finite) {
     bool ok = true;
+    double scale = 0, maxdiff = 0;               // the current matrix's
+    const auto close_matrix = [&] { if (maxdiff > 0) g_rel = std::fmax(g_rel, scale > 0 ? maxdiff / scale : HUGE_VAL); scale = maxdiff = 0; };
     for (size_t i = 0; i < a.size(); ++i) {
+        if (i > 0 && i % n_out == 0) close_matrix();
         const bool fa = std::isfinite(a[i]), fb = std::isfinite(b[i]);
         if (fa && fb) {
             ++finite;
-            g_scale = std::fmax(g_scale, std::fabs((double) a[i]));
+            scale = std::fmax(scale, std::fabs((double) a[i]));
             if (std::memcmp(&a[i], &b[i], 4) != 0) {
                 ok = false; ++g_notbit;
-                g_maxdiff = std::fmax(g_maxdiff, std::fabs((double) a[i] - (double) b[i]));
+                maxdiff = std::fmax(maxdiff, std::fabs((double) a[i] - (double) b[i]));
             }
         }
         else {
@@ -50,6 +56,7 @@ static bool same_bits(const std::vector<float>& a, const std::vector<float>& b, 
             if (!both_nan && !same_inf) { ok = false; ++g_badclass; }   // finite vs non-finite, or NaN vs Inf: a real difference
         }
     }
+    close_matrix();
     return ok;
 }
 
@@ -116,7 +123,7 @@ static bool run(sycl::queue& q, const Fmt& f, int n_in, int n_out, int count, in
     }
 
     bool ok = true; long nf = 0, fin = 0;
-    g_maxdiff = g_scale = 0; g_notbit = 0; g_badclass = 0;
+    g_rel = 0; g_notbit = 0; g_badclass = 0;
     // ids
     k::MmvqIds mi{};
     mi.table = d_table; mi.ids = d_ids; mi.offset = offset; mi.x = d_xq; mi.x_stride = xq; mi.x_every = x_every;
@@ -126,7 +133,7 @@ static bool run(sycl::queue& q, const Fmt& f, int n_in, int n_out, int count, in
     bool ran_ids = false;
     if (supported) ran_ids = k::native_mmvq_ids(f.type, mi, count, n_in, n_out, (void*) &q);
     q.wait_and_throw();
-    if (supported && ran_ids) { q.memcpy(got.data(), d_y, got.size() * 4).wait(); ok &= same_bits(ref, got, nf, fin); }
+    if (supported && ran_ids) { q.memcpy(got.data(), d_y, got.size() * 4).wait(); ok &= same_bits(ref, got, (size_t) n_out, nf, fin); }
     else ok = false;
     const bool ids_ok = ok;                    // bit-exact (finite values) and ran
     const bool ids_ran_ok = supported && ran_ids;
@@ -141,11 +148,11 @@ static bool run(sycl::queue& q, const Fmt& f, int n_in, int n_out, int count, in
     q.memset(d_y, 0xFF, got.size() * 4).wait();
     const bool ran_slots = k::native_mmvq_slots(f.type, ms, count, n_in, n_out, (void*) &q);
     q.wait_and_throw();
-    if (ran_slots) { q.memcpy(got.data(), d_y, got.size() * 4).wait(); ok &= same_bits(ref, got, nf, fin); } else ok = false;
+    if (ran_slots) { q.memcpy(got.data(), d_y, got.size() * 4).wait(); ok &= same_bits(ref, got, (size_t) n_out, nf, fin); } else ok = false;
     // Not bit-equal is acceptable only as a reordering of the same float sum: the largest difference is a small fraction
     // of the largest output.  (The port's single-column kernels for some formats are SIMD16 / wide variants that add the
     // terms in another order than the slots kernels, which are CUDA's EXACT layout.)
-    const double rel = g_scale > 0 ? g_maxdiff / g_scale : 0;
+    const double rel = g_rel;
     const bool close = ids_ran_ok && ran_slots && rel < 1e-4 && g_badclass == 0;
     std::printf("  %-8s n_in=%-5d n_out=%-4d count=%-2d x_every=%d lanes=%d  ids %s (%ld finite pairs not bit-equal) slots %s  "
                 "compared finite %ld NaN/Inf %ld; max diff / max output = %.2e  %s\n",

@@ -4398,7 +4398,9 @@ int slots_kind(int ggml_type) {
 #else
     switch (ggml_type) {
     case 2: case 6: case 8: case 20: case 11: case 12: case 13: case 14: case 23: case 42: return 1;
-    case 7: case 16: case 17: case 18: case 21: case 22: case 29: case 19: case 40: return 2;   // the ones native_mmvq() hands to iq_mmvq()
+    // the ones native_mmvq() hands to iq_mmvq().  IQ1_S (19) is not here: iq_kernels has its kernel, but native_mmvq() and
+    // native_mmvq_supported() do not list it, so a host-routed or prefill visit would throw; keep the three in step.
+    case 7: case 16: case 17: case 18: case 21: case 22: case 29: case 40: return 2;
     default: return 0;
     }
 #endif
@@ -4425,7 +4427,8 @@ void launch_slots_of(int ggml_type, const S& slots, int count, int n_in, int n_o
     case 13: launch_slots<Q5KTraits>(slots, count, n_in, n_out, s); break;
     case 14: launch_slots<Q6KTraits>(slots, count, n_in, n_out, s); break;
     case 23: launch_slots<IQ4XSTraits>(slots, count, n_in, n_out, s); break;
-    default: launch_slots<Q20Traits>(slots, count, n_in, n_out, s); break;
+    case 42: launch_slots<Q20Traits>(slots, count, n_in, n_out, s); break;
+    default: throw std::invalid_argument("native MMVQ slots: no kernel for this GGML type");
     }
     launch_check();
 }

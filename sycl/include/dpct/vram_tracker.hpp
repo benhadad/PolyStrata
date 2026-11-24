@@ -24,7 +24,11 @@ inline void *vram_note(void *p, size_t n) {
   auto &t = vram_tracker();
   if (p && t.on.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> g(t.mu);
-    t.sizes[p] = n;
+    const auto [it, inserted] = t.sizes.emplace(p, n);
+    if (!inserted) {   // an address counted before and freed without vram_drop(): replace its old size
+      t.bytes -= it->second;
+      it->second = n;
+    }
     t.bytes += n;
   }
   return p;

@@ -97,6 +97,7 @@ static bool run_case(sycl::queue& q, const Case& c, uint32_t seed) {
         return true;
     } catch (const sycl::exception& e) {
         printf("  %-34s SYCL exception: %s\n", c.what, e.what());
+        sycl::free(dw, q); sycl::free(dx, q); sycl::free(dy, q); sycl::free(dq, q);
         return false;
     }
 

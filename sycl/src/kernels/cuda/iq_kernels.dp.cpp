@@ -4841,7 +4841,8 @@ void iq_mmvq_ids(int t, const MmvqIds& ids, int count, int n_in, int n_out, void
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {
-    // scale: NVFP4's s_down (CUDA only; the SYCL port has no NVFP4 experts, so it is never given here)
+    // scale: NVFP4's s_down.  This port's dequant does not handle it: a non-null scale exits below.  (The port's NVFP4
+    // experts are read by the mmvq kernels, not through here; a prefill path that dequantizes NVFP4 would need this.)
     if (n % 256 != 0 || !is_iq(t) || scale != nullptr) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     {
 
