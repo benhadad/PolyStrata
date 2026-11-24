@@ -595,9 +595,11 @@ protected:
     /// Whether n tokens take layer L's routed experts as a prompt batch, through MMQ (moe_rows()), and not a few at
     /// a time (moe()).
     bool batched(const Layer& L, int n) const;
-    /// The routed experts' rows a call routed on the card has room for (d_): a window of a model that guesses its
-    /// own block, or kSumRows.  The others keep kSumRows, whose windows past it are routed on the host as before.
+    /// The routed experts' rows a call routed on the card has room for (d_, and g_, h_, q8_): a window of a model that
+    /// guesses its own block, or every pick of the most tokens card_moe() takes (kStageRows - 1), or kSumRows.
     int card_rows() const;
+    /// Whether moe_router()'s call of n tokens at layer L is routed on the card (moe_card()), so its host copies are not read.
+    bool card_visit(const Layer& L, int n) const;
     void moe_add(int n);
     template <class F>
     void* record(F&& work);

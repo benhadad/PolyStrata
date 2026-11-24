@@ -3221,9 +3221,13 @@ void Engine::shared_scratch() {
     xn_ = fbuf(e);
     ao_ = fbuf(e);
     fo_ = fbuf(e);
-    g_ = fbuf(ff);   // a routed expert's gate and up rows come out of one launch, back to back
+    // moe_card() keeps up to card_rows() picks' gate and up rows (2 * n_ff_exp_ each) in g_ and their activations in
+    // h_, whatever the batch: a call of one token has n_used_ picks, which the per-token size above (rows_ = 1 at
+    // --prompt-batch 1) does not hold.
+    const size_t picks_g = (size_t) card_rows() * 2 * n_ff_exp_, picks_h = (size_t) card_rows() * n_ff_exp_;
+    g_ = fbuf(std::max(ff, picks_g));   // a routed expert's gate and up rows come out of one launch, back to back
     u_ = fbuf(ff);
-    h_ = fbuf(ff);
+    h_ = fbuf(std::max(ff, picks_h));
     d_ = fbuf((size_t) card_rows() * n_embd_);   // the routed experts of a few tokens, until they are added up
     rl_ = fbuf(n * n_expert_);
     logits_ = fbuf((size_t) n_vocab_);
@@ -3320,7 +3324,10 @@ void Engine::alloc() {
 
     const int q_max = std::max({n_embd_, n_ff_, n_ff_exp_, n_ff_shexp_, widest(), 256});
     xq_ = dmalloc(n * kernels::native_q8_1_bytes(n_embd_), "scratch");
-    q8_ = dmalloc(n * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256), "scratch");
+    // moe_card() quantizes up to card_rows() picks' activations (n_ff_exp_ wide) into q8_ as well
+    q8_ = dmalloc(std::max(n * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256),
+                           (size_t) card_rows() * kernels::native_q8_1_bytes((n_ff_exp_ + 255) / 256 * 256)),
+                  "scratch");
 
     h_r_ = (float*) hmalloc(n * streams() * n_embd_ * sizeof(float), "pinned memory");
     const size_t at_rows = (size_t) std::max(opt_.window, opt_.batch + 1);   // window()'s tokens, step()'s
@@ -3878,11 +3885,29 @@ void Engine::router_scores(const Layer& L, int n) { lin(L.gate_inp, xn_, rl_, n,
 
 bool Engine::batched(const Layer& L, int n) const { return mmq_ && L.mmq && n >= kStageRows; }
 
-int Engine::card_rows() const { return block_guess_ ? std::max(kSumRows, opt_.window * n_used_) : kSumRows; }
+// Every call that card_moe() takes (fewer than kStageRows tokens) has room for its picks: with the experts all in
+// VRAM nothing else limits them (native_mmvq_ids takes up to 65535 picks).  Before, a prompt batch of more than
+// kSumRows / n_used_ tokens (8 tokens of a model with 8 experts a token) was routed on the host.
+int Engine::card_rows() const {
+    return block_guess_ ? std::max(kSumRows, opt_.window * n_used_) : std::max(kSumRows, (kStageRows - 1) * n_used_);
+}
+
+// Whether the call of n tokens at layer L is one that moe_card() takes: card_moe()'s conditions, and a layer that has
+// shown it routes on the card (Layer::card, set by moe_card() on its first call).  The draft block (the layer after
+// the model's) is always routed on the host.
+bool Engine::card_visit(const Layer& L, int n) const {
+    const int il = (int) (&L - layers_.data());
+    return il < n_layer_ && n < kStageRows && all_cached() && d_slots_ && n * n_used_ <= card_rows() && !opt_.dump &&
+           layers_[(size_t) home_of(il)].card == 1;
+}
 
 // The router's scores, and the copies of them and of the experts' input to the host.
 void Engine::moe_router(const Layer& L, int n) {
     router_scores(L, n);
+    // A layer routed on the card reads neither copy (moe() is not called), so they and the next layer's read-ahead
+    // would only be a device-to-host transfer a layer.  The first visit of a layer still copies: Layer::card is not
+    // known before moe_card() has run.
+    if (card_visit(L, n)) return;
     copy2(rl_, h_rl_, n * n_expert_, xn_, h_x_, n * n_embd_, st_);
     if (prefetch_k_ <= 0 || block_pass_ || n > 16) return;
     size_t part = 0;
