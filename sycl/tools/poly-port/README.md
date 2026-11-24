@@ -13,6 +13,7 @@ Status: **work in progress, not a pull request.** A SYCL port of the poly engine
   - The two batches differ by about 3 tok/s in the mean and we do not know why (the gap between runs is one difference; GPU clocks and temperature were not recorded). Expect roughly 31 to 41 tok/s on this machine.
   - All 44 completed runs printed the same 64 tokens.
 - One of the 15 runs in batch 1 exited at startup with `Level-Zero error:78000013` (`ZE_RESULT_ERROR_INVALID_GROUP_SIZE_DIMENSION`) in the oneMKL warm-up product (`kernels.dp.cpp`, `blas_create`). Not explained; it did not recur in batch 2's 30 runs. The one `DEVICE_LOST` we saw during evaluation (1 of 11 runs, before `h2d_copy`) has not recurred in the 62 runs since (8 + 6 + 3 + 15 + 30 on the fixed build).
+- Long prompts (after the `poly_shims.cpp` fix, a binary built from the sources of `8c9babfc1` plus that one change; the small fixes of the commit before it are not in that binary; single runs, token IDs 1..n, 16 new tokens): prompts of 9, 16 and 32 tokens run. Each gives the same generated tokens with the default batch and with `--prompt-batch 8` (chunks of 8, the path that worked before), prompt speed 15.2, 28.3 and 44.9 tok/s. The 8-token, 64-token run still printed the same 64 tokens as the 44 earlier runs. Not checked against llama.cpp; that decode run gave 26.0 tok/s, below the 31 to 41 range above, one run on a freshly rebuilt binary, not explained.
 - Earlier figures (17.2, 19.97 and 22.97 tok/s) were single runs on other days, before the expert-routing "card" path worked, so they are not comparable with the figures above.
 - **Not validated:** no comparison of logits or tokens with llama.cpp or the CUDA build, so "the same every time" is not "correct". One prompt, one model, one machine, WSL2 only. No CUDA/HIP build of the touched shared files.
 
@@ -42,7 +43,7 @@ Commits 3 and 7 are source only and do not build alone; commit 8 wires them in.
 
 ## Known gaps
 - Stubs: `Mmq` and the `native_add_rms_norm_q8_1` residual variant (throws). Tensor-core attention and VMM are off. Prompt speed is the weak spot.
-- Prompts of more than 8 tokens fail with `native MMVQ requires 1 <= ncols <= 8` (the stubbed `Mmq` falls back to `native_mmvq`). Probably not new; not checked against the old binary.
+- Prompts of more than 8 tokens used to fail with `native MMVQ requires 1 <= ncols <= 8`. Cause: the RMSNorm shim passed the row count as the column count of the Q8_1 quantizer (limit 8). Fixed in the commit after `dfdbaea46` (`poly_shims.cpp`); see "Long prompts" under Measured. Long-prompt speed is still not tuned (the `Mmq` stub, no tiled prefill).
 - `native_mmvq_jobs` (the attention projections) has no test; the Inkling kernels have only `inkling_gemv`.
 - The engine factory is trimmed to Inkling only.
 - `sycl/include` here is older than main's, hence the shims above.
