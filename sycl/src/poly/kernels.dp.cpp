@@ -3796,7 +3796,8 @@ __dpct_inline__ void gdn_state_reg_kernel(
         correctness. SYCL math built-in function rounding mode is aligned with
         OpenCL C 1.2 standard.
         */
-        const float d = va - sk * sa;
+        // the CUDA's __fmul_rn(__fsub_rn(va, sk), sa): dpct dropped the parentheses and made it va - sk * sa
+        const float d = (va - sk) * sa;
         float o = 0.0f;
         float* m = snap_of(snap, stride, snaps, row);
         if (m) m += mine;

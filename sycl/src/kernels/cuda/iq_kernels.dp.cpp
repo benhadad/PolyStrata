@@ -1432,7 +1432,7 @@ __dpct_inline__ void row_dot_40_sub8(const uint8_t *row, const block_q8_1 *x,
                 code. Verify the correctness. SYCL math built-in function
                 rounding mode is aligned with OpenCL C 1.2 standard.
                 */
-                s[c] = s[c] + s8[c] + s24;
+                s[c] = s[c] + (s8[c] + s24);   // the CUDA's __fadd_rn(s, __fadd_rn(s8, s24)): dpct dropped the parentheses
             }
         }
     }

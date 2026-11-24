@@ -113,6 +113,13 @@ def kern(s):
     s = s.replace("strata::poly::(anonymous namespace)::", "")
     # a template argument dpct could not deduce, for a kernel that is not a template
     s = re.sub(r"(class attn_value_kernel_[0-9a-f]+),\s*dpct_placeholder /\*Fix the type mannually\*/>>", r"\1>>", s)
+    # dpct (DPCT1013) drops the parentheses of nested __fadd_rn/__fsub_rn/__fmul_rn calls: restore the CUDA's grouping
+    s = s.replace("const float d = va - sk * sa;",
+                  "// the CUDA's __fmul_rn(__fsub_rn(va, sk), sa): dpct dropped the parentheses and made it va - sk * sa\n"
+                  "        const float d = (va - sk) * sa;")
+    s = s.replace("float v = sh[h][0] + sh[h][2] + sh[h][1] + sh[h][3];",
+                  "// the CUDA's __fadd_rn(__fadd_rn(sh0, sh2), __fadd_rn(sh1, sh3)): dpct dropped the parentheses\n"
+                  "                float v = (sh[h][0] + sh[h][2]) + (sh[h][1] + sh[h][3]);")
     s = wrapper_names(s)
     if "__cvta_generic_to_shared(p)" not in s.split("#include", 3)[0] and "#define __cvta_generic_to_shared" not in s:
         s = re.sub(r"(#include <dpct/dpct\.hpp>\n)", r"\1" + PRELUDE.replace("\\", "\\\\"), s, count=1)

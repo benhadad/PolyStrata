@@ -670,7 +670,8 @@ auto &sm_m = *sycl::ext::oneapi::group_local_memory_for_overwrite<
                 code. Verify the correctness. SYCL math built-in function
                 rounding mode is aligned with OpenCL C 1.2 standard.
                 */
-                float v = sh[h][0] + sh[h][2] + sh[h][1] + sh[h][3];
+                // the CUDA's __fadd_rn(__fadd_rn(sh0, sh2), __fadd_rn(sh1, sh3)): dpct dropped the parentheses
+                float v = (sh[h][0] + sh[h][2]) + (sh[h][1] + sh[h][3]);
 #pragma unroll
                 /*
                 DPCT1108:131: '__shfl_xor_sync' was migrated with the
