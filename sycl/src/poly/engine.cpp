@@ -4656,7 +4656,7 @@ bool Engine::card_moe(int n) {
 static bool xmx_type(int t, int k) {
     int qk;
     switch (t) {
-        case 18: case 21: case 22: case 23: qk = 256; break;   // IQ3_XXS, IQ3_S, IQ2_S, IQ4_XS
+        case 11: case 17: case 18: case 21: case 22: case 23: qk = 256; break;   // Q3_K, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S, IQ4_XS
         case 20: qk = 32; break;                               // IQ4_NL
         case 40: case 42: qk = 64; break;                      // NVFP4, Q2_0
         default: return false;
@@ -4676,6 +4676,7 @@ bool Engine::xmx_layer(const Layer& M, int n) const {
 // is added in each token's pick order, as moe_sum() does.
 bool Engine::moe_xmx(Layer& L, int il, int n) {
     const int rr = n * n_used_, ne = n_expert_, ff = n_ff_exp_;
+    sub_lap("x-pre", n);
     if (!route_card(il, n, d_ids_, d_wts_)) return false;
     std::vector<int32_t> ids((size_t) rr);
     ck(DPCT_CHECK_ERROR(cs(st_)->memcpy(ids.data(), d_ids_, (size_t) rr * sizeof(int32_t)).wait()), "xmx experts");
@@ -4693,6 +4694,7 @@ bool Engine::moe_xmx(Layer& L, int il, int n) {
         esort[q] = e;
     }
     h2d_copy(xmx_idx_, idx.data(), idx.size() * sizeof(int32_t));
+    sub_lap("x-route-sort", n);
     // the sorted rows of an expert-by-expert product, up to kXmxGroupMax experts a launch
     const auto grouped = [&](int ty, size_t slot_off, const uint16_t* x, float* y, int n_out, int k) {
         int done = 0;
@@ -4712,13 +4714,18 @@ bool Engine::moe_xmx(Layer& L, int il, int n) {
         }
     };
     xmx::gather_f16(xn_, n_embd_, xmx_idx_, rr, n_embd_, xmx_xh_, st_);
+    sub_lap("x-gather", n);
     grouped((int) L.gu_type, 0, xmx_xh_, xmx_yg_, 2 * ff, n_embd_);
+    sub_lap("x-gateup", n);
     const ExpertScales es = expert_scales(L, xmx_idx_ + rr);
     act_rows(xmx_yg_, xmx_hf_, rr, clamp_exp_[(size_t) il], &es);
     xmx::f32_to_f16(xmx_hf_, xmx_h16_, (size_t) rr * ff, st_);
+    sub_lap("x-act", n);
     grouped((int) L.d_type, L.gu2(), xmx_h16_, xmx_yd_, n_embd_, ff);
+    sub_lap("x-down", n);
     if (!L.h_s_down.empty()) expert_weights(d_wts_, fp(L.s_down), d_ids_, rr, st_);
     xmx::sum_perm(xmx_yd_, xmx_idx_ + 2 * rr, d_wts_, fo_, n_embd_, n_used_, n, st_);
+    sub_lap("x-sum", n);
     stats_.gpu_experts += rr;
     return true;
 }
