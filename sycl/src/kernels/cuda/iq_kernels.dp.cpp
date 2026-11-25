@@ -759,21 +759,24 @@ __dpct_inline__ float vec_dot_q8_0_q8_1(const void *__restrict__ vbq,
 
 // = get_int_from_table_16(aux, kvalues_fp4) without the table in global memory: the low nibbles of aux's four bytes
 // (x) and the high nibbles (y), each looked up in the E2M1 values doubled {0,1,2,3,4,6,8,12, then negated}.
+// Four E2M1 codes, one in the low 4 bits of each byte of n (the other bits 0), as the four int8 values doubled, in the
+// same bytes, with no branches: for the magnitude m (3 bits, b2 b1 b0) the value is t = m & 3 when b2 = 0 and
+// 4 + t + 2 b1 b0 when b2 = 1 ({0,1,2,3} and {4,6,8,12}); the sign negates the byte.  The byte-wise 'x + 1' of the
+// negation is done without a carry into the next byte (a negative zero is the byte 0).  Equal to the loop it replaced
+// for every input (checked on all 2^32 words on the host, ~/poly-spike/fp4t).
+__dpct_inline__ uint32_t fp4_bytes(uint32_t n) {
+    const uint32_t m = n & 0x07070707u;
+    const uint32_t t = m & 0x03030303u;
+    const uint32_t b01 = (m & (m >> 1)) & 0x01010101u;
+    const uint32_t b2 = (m >> 2) & 0x01010101u;
+    const uint32_t v = t + ((0x04040404u + t + (b01 << 1)) & (b2 * 255u));
+    const uint32_t s = (n >> 3) & 0x01010101u;
+    const uint32_t x = v ^ (s * 255u);
+    return ((x & 0x7F7F7F7Fu) + s) ^ (x & 0x80808080u);
+}
 __dpct_inline__ sycl::int2 fp4_pair(int aux) {
     const uint32_t a = (uint32_t) aux;
-    uint32_t lo = 0, hi = 0;
-#pragma unroll
-    for (int b = 0; b < 4; ++b) {
-        const uint32_t byte = (a >> (8 * b)) & 0xFF;
-        const uint32_t cl = byte & 0xF, ch = byte >> 4;
-        const int ml = cl & 7, mh = ch & 7;
-        const int vl = ml < 5 ? ml : (ml == 5 ? 6 : (ml == 6 ? 8 : 12));
-        const int vh = mh < 5 ? mh : (mh == 5 ? 6 : (mh == 6 ? 8 : 12));
-        const int sl = (cl & 8) ? -vl : vl, sh = (ch & 8) ? -vh : vh;
-        lo |= ((uint32_t) (uint8_t) (int8_t) sl) << (8 * b);
-        hi |= ((uint32_t) (uint8_t) (int8_t) sh) << (8 * b);
-    }
-    return sycl::int2((int) lo, (int) hi);
+    return sycl::int2((int) fp4_bytes(a & 0x0F0F0F0Fu), (int) fp4_bytes((a >> 4) & 0x0F0F0F0Fu));
 }
 // NVFP4 (ModelOpt): 64 values = 4 sub-blocks of 16, one UE4M3 scale each, E2M1 codes split-half like Q4_0.
 // kvalues_fp4 holds the E2M1 values doubled, so the scale is halved here (ggml's ue4m3_to_fp32, in software).
@@ -2942,6 +2945,39 @@ __dpct_inline__ void dq32_iq4_nl(const block_iq4_nl* blk, sycl::half* y) {
     store_run<sycl::half, 8>(y + 8, lo + 8);
     store_run<sycl::half, 8>(y + 16, hi);
     store_run<sycl::half, 8>(y + 24, hi + 8);
+}
+// Q3_K loader for the grouped XMX GEMM (xmxg::launch, STRATA_XG_NV): ONE thread decodes one 32-value group g (0..7) of a
+// 256-value block, the K step of a tile row: n = g / 4 is the half of the block, j = g % 4 the 2-bit plane of that half.
+// It reads the group's 32 qs bytes and 32 hmask bytes as 16-bit words (blocks are 110 bytes, 2-byte aligned) and unpacks
+// the two 6-bit scales once, where dq_q3_k_g unpacks them for each of the 8 parts of a block it decodes.  Same
+// arithmetic as dq_q3_k_part: d * (scale - 32) * ((q & 3) - (hmask bit ? 0 : 4)).
+__dpct_inline__ int q3k_scale6(const uint8_t* s, int is) {
+    return is < 4  ? ((s[is] & 0xF) | (((s[is + 8] >> 0) & 3) << 4)) :
+           is < 8  ? ((s[is] & 0xF) | (((s[is + 4] >> 2) & 3) << 4)) :
+           is < 12 ? ((s[is - 8] >> 4) | (((s[is + 0] >> 4) & 3) << 4)) :
+                     ((s[is - 8] >> 4) | (((s[is - 4] >> 6) & 3) << 4));
+}
+__dpct_inline__ void dq32_q3_k(const block_q3_K* blk, int g, sycl::half* y) {
+    const int n = g >> 2, j = g & 3;
+    const float d = (float) blk->d;
+    const float dl0 = d * (q3k_scale6(blk->scales, 8 * n + 2 * j) - 32);
+    const float dl1 = d * (q3k_scale6(blk->scales, 8 * n + 2 * j + 1) - 32);
+    const uint16_t* qw = (const uint16_t*) (blk->qs + 32 * n);
+    const uint16_t* hw = (const uint16_t*) blk->hmask;
+    const int qsh = 2 * j, hsh = 4 * n + j;
+    float v[32];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const uint32_t w = qw[i], h = hw[i];
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const int q = (int) ((w >> (8 * e + qsh)) & 3);
+            const int hb = (int) ((h >> (8 * e + hsh)) & 1);
+            v[2 * i + e] = (i < 8 ? dl0 : dl1) * (float) (q + 4 * hb - 4);
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) store_run<sycl::half, 8>(y + 8 * k, v + 8 * k);
 }
 template <typename dst_t>
 inline void dq_nvfp4(const void *vx, int64_t ibs, dst_t *yy, int tid) {
@@ -5982,7 +6018,20 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                         }
                     }
                 }
-                constexpr bool own_loader = TY == 40 || TY == 20;
+                // Q3_K, nv 1: a thread takes a whole 32-value group of a tile row (dq32_q3_k)
+                if constexpr (TY == 11) {
+                    if (nv >= 1 && !(dbg & 1)) {
+                        for (int v = lid; v < BN * (KS / 32); v += WG) {
+                            const int r = v / (KS / 32), c32 = v % (KS / 32), nr = n0 + r;
+                            const uint8_t* base = gu ? ((nr & 1) ? wb : wa) : wa;
+                            const int64_t row = gu ? (nr >> 1) : nr;
+                            const int64_t flat = row * K + k0 + 32 * c32;   // a multiple of 32
+                            dq32_q3_k((const block_q3_K*) base + (flat >> 8), (int) ((flat & 255) >> 5),
+                                      pb + r * LDB + 32 * c32);
+                        }
+                    }
+                }
+                constexpr bool own_loader = TY == 40 || TY == 20 || TY == 11;
                 if (!(dbg & 1) && !(own_loader && nv >= 1))
                 for (int v = lid; v < BN * (KS / 8); v += WG) {
                     const int r = v / (KS / 8), t8 = v % (KS / 8), c32 = t8 >> 2, sub = t8 & 3, nr = n0 + r;
@@ -6079,6 +6128,7 @@ void go(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, Grp& gp,
     if (spec && ty == 40) launch<C, k_xg<C, 40, true>, 40, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg, nv);
     else if (spec && ty == 18) launch<C, k_xg<C, 18, true>, 18, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
     else if (spec && ty == 20) launch<C, k_xg<C, 20, true>, 20, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg, nv);
+    else if (spec && ty == 11) launch<C, k_xg<C, 11, true>, 11, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg, nv);
     else launch<C, k_xg<C, -1, true>, -1, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
 }
 }  // namespace xmxg

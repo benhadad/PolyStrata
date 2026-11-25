@@ -24,6 +24,14 @@
 
 // STRATA_PROJ_XMX: the largest dense matrix (in values) taken as halves; 64 Mi values is 128 MiB of scratch
 static constexpr size_t kProjMaxValues = size_t(64) << 20;
+// The fewest outputs a matrix has to take the fp16 product of a prompt batch (STRATA_PROJ_MIN_OUT, default 1).  The
+// matrices under 512 outputs (Inkling's attention gate, relative bias and sink) used to run as native_mmvq in launches of
+// 8 tokens, a launch for every 8 tokens of the batch: 140 of 754 ms of the head of a 1023-token call on the B70.  Same
+// tokens and llama.cpp-matching probabilities; STRATA_PROJ_MIN_OUT=512 is the old rule.
+static int64_t proj_min_out() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_PROJ_MIN_OUT"); return e ? (int64_t) std::atoll(e) : (int64_t) 1; }();
+    return v;
+}
 #include "strata/platform/memory.hpp"
 
 #include "ggml.h"
@@ -1813,7 +1821,8 @@ Dev Engine::upload_as(const TensorInfo* t, const std::string& name, int64_t n_in
     const uint32_t type = as_is ? t->type : want == kF32 ? kTypeF32 : kTypeBF16;
     const size_t out = as_is ? bytes : count * (type == kTypeF32 ? sizeof(float) : sizeof(uint16_t));
     if (type == kTypeBF16) bf16_max_ = std::max(bf16_max_, count);
-    if (as_is && (type == 8 || type == 12 || type == 13 || type == 14) && count <= kProjMaxValues && n_out >= 512) {
+    if (as_is && (type == 8 || type == 12 || type == 13 || type == 14) && count <= kProjMaxValues &&
+        (int64_t) n_out >= proj_min_out()) {
         proj_w_max_ = std::max(proj_w_max_, count);
         proj_x_max_ = std::max(proj_x_max_, (size_t) n_in);
     }
@@ -3867,6 +3876,9 @@ void Engine::lin_jobs(const LinJob* jobs, int count, int n) {
             done[idx[j]] = true;
         }
     }
+    // the fp16 products of a prompt batch convert an input once for the jobs that share it
+    x16_share_ = true; x16_src_ = nullptr;
+    struct Reset { Engine* e; ~Reset() { e->x16_share_ = false; e->x16_src_ = nullptr; } } reset{this};
     for (int i = 0; i < count; ++i)
         if (!done[i]) lin(*jobs[i].w, jobs[i].x, jobs[i].y, n, jobs[i].xq);
 }
@@ -3899,10 +3911,24 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
     }
     // STRATA_PROJ_XMX (on unless 0): a prompt batch's projection as one half product (the weight dequantized, the input as halves)
     if (proj_on_ && n >= kStageRows && n <= rows_ && (w.type == 8 || w.type == 12 || w.type == 13 || w.type == 14) &&
-        (size_t) w.n_in * w.n_out <= proj_w_max_ && (size_t) w.n_in <= proj_x_max_ && w.n_out >= 512 && !opt_.dump) {
+        (size_t) w.n_in * w.n_out <= proj_w_max_ && (size_t) w.n_in <= proj_x_max_ && w.n_out >= proj_min_out() &&
+        !opt_.dump) {
+        sub_lap("pj-before", n);
+        {   // STRATA_STAGE_PROF=2: the first projections' shapes, once
+            static int shown = 0;
+            static const bool on = [] { const char* e = std::getenv("STRATA_STAGE_PROF"); return e && std::atoi(e) >= 2; }();
+            if (on && shown < 12) { ++shown; std::fprintf(stderr, "proj-shape type %d n_out %d n_in %d n %d\n", (int) w.type, (int) w.n_out, (int) w.n_in, n); }
+        }
         kernels::dequant_f16((int) w.type, w.p, 0, w.n_out, w.n_in, proj_w16_, st_);
-        xmx::f32_to_f16(x, proj_x16_, (size_t) n * w.n_in, st_);
+        sub_lap("pj-dequant", n);
+        // the matrices of one lin_jobs() call that read the same input (Q, gate, rel and sink; K, V) convert it once
+        if (!(x16_share_ && x == x16_src_ && x16_n_ == n && x16_in_ == w.n_in)) {
+            xmx::f32_to_f16(x, proj_x16_, (size_t) n * w.n_in, st_);
+            if (x16_share_) { x16_src_ = x; x16_n_ = n; x16_in_ = w.n_in; }
+        }
+        sub_lap("pj-x16", n);
         gemm_f16w(blas_, proj_w16_, proj_x16_, y, w.n_in, w.n_out, n);
+        sub_lap("pj-gemm", n);
         return;
     }
     // a prompt batch: llama.cpp's matrix-matrix kernels read the weights once for all the tokens
@@ -3928,6 +3954,7 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
     for (int at = 0; at < n; at += 8)
         kernels::native_mmvq((int) w.type, w.p, (const uint8_t*) xq + (size_t) at * token,
                              y + (size_t) at * w.n_out, w.n_in, w.n_out, std::min(8, n - at), st_);
+    sub_lap("lin-mmvq", n);
 }
 
 void Engine::router_scores(const Layer& L, int n) { lin(L.gate_inp, xn_, rl_, n, xq_); }
@@ -4741,6 +4768,7 @@ bool Engine::moe_card(Layer& L, int il, int n) {
         return false;
     }
     L.card = 1;
+    if (abl(128, n)) return true;
     const int rr = n * n_used_;
     const void* const* table = d_slots_ + (size_t) il * n_expert_;
     const size_t xq_row = kernels::native_q8_1_bytes(n_embd_), ff = (size_t) n_ff_exp_;
@@ -5601,8 +5629,10 @@ void Engine::run(const int32_t* tokens, int n) {
     }
     // STRATA_STAGE_PROF=1: wait for the card after each part of a layer of a prompt batch and add up the times
     // (printed once a call of kStageRows tokens or more is through).  Diagnostic: the waits themselves cost a little.
+    // STRATA_STAGE_PROF=3 (with --no-graphs): the same laps for a decode call (n < kStageRows), averaged over 20 calls
     static const bool prof = std::getenv("STRATA_STAGE_PROF") != nullptr;
-    const bool timed = prof && n >= kStageRows;
+    static const bool prof_small = prof && std::atoi(std::getenv("STRATA_STAGE_PROF")) >= 3;
+    const bool timed = prof && (n >= kStageRows || prof_small);
     double t_up = 0, t_moe = 0, t_tail = 0, t_nonrouted = 0;
     const auto lap = [&](double& acc, Clock::time_point& t) {
         if (!timed) return;
@@ -5629,6 +5659,26 @@ void Engine::run(const int32_t* tokens, int n) {
         tail(il, n, (size_t) n - 1);
         lap(t_tail, tp);
     }
+    if (timed && n < kStageRows) {   // decode: add up, print the mean of 20 calls
+        static double a_up = 0, a_moe = 0, a_tail = 0, a_non = 0;
+        static std::vector<std::pair<std::string, double>> a_sub;
+        static int calls = 0;
+        a_up += t_up; a_moe += t_moe; a_tail += t_tail; a_non += t_nonrouted;
+        for (const auto& e : sub_ms_) {
+            bool found = false;
+            for (auto& f : a_sub) if (f.first == e.first) { f.second += e.second; found = true; break; }
+            if (!found) a_sub.emplace_back(e.first, e.second);
+        }
+        if (++calls == 20) {
+            std::fprintf(stderr, "stage-prof decode (mean of 20 calls, waits after every part): head+shared %.2f ms, experts %.2f ms, tail %.2f ms, unrouted layers %.2f ms\n",
+                         a_up / 20, a_moe / 20, a_tail / 20, a_non / 20);
+            std::fprintf(stderr, "stage-prof decode head parts:");
+            for (const auto& f : a_sub) std::fprintf(stderr, " %s %.2f", f.first.c_str(), f.second / 20);
+            std::fprintf(stderr, "%c", 10);
+            a_up = a_moe = a_tail = a_non = 0; a_sub.clear(); calls = 0;
+        }
+        return;
+    }
     if (timed)
         std::fprintf(stderr, "stage-prof n=%d: head+shared %.1f ms, experts %.1f ms, tail %.1f ms, unrouted layers %.1f ms" "\n", n,
                      t_up, t_moe, t_tail, t_nonrouted);
@@ -5644,7 +5694,8 @@ void Engine::run(const int32_t* tokens, int n) {
 void Engine::sub_lap(const char* name, int n) {
     static const char* pe = std::getenv("STRATA_STAGE_PROF");
     static const bool on = pe && std::atoi(pe) >= 2;
-    if (!on || n < kStageRows) return;
+    static const bool small = pe && std::atoi(pe) >= 3;
+    if (!on || (n < kStageRows && !small)) return;
     ck(DPCT_CHECK_ERROR(cs(st_)->wait_and_throw()), "sub profile");
     const auto now = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(now - sub_t_).count();

@@ -898,6 +898,17 @@ protected:
     bool proj_on_ = false;                        ///< STRATA_PROJ_XMX: a prompt batch's dense projections as fp16 products
     uint16_t *proj_w16_ = nullptr, *proj_x16_ = nullptr;   ///< the weight dequantized, the batch's input as halves
     size_t proj_w_max_ = 0, proj_x_max_ = 0;      ///< their sizes in values
+    /// STRATA_ABLATE=<mask> (diagnostic, garbage output): skip parts of a one-token call's visit to time the rest.  1 the
+    /// attention's mix, 2 the message mix and controllers, 4 the norms, 8 the attention, 16 the convolutions after it,
+    /// 32 the FFN's mix, controller and norm, 64 the shared experts' zeroing, 128 the routed experts' products (the
+    /// router still runs).
+    static bool abl(int bit, int n) {
+        static const int mask = [] { const char* e = std::getenv("STRATA_ABLATE"); return e ? std::atoi(e) : 0; }();
+        return n == 1 && (mask & bit) != 0;
+    }
+    bool x16_share_ = false;                      ///< inside lin_jobs(): proj_x16_ keeps the input of the matrix before
+    const float* x16_src_ = nullptr;              ///< ... which input that is, for how many tokens and values each
+    int x16_n_ = 0, x16_in_ = 0;
     float* wf_ = nullptr;      ///< the largest BF16 matrix as floats: lin() multiplies a prompt batch by cuBLAS
     size_t bf16_max_ = 0;      ///< that matrix's values
     float *g_ = nullptr, *u_ = nullptr, *h_ = nullptr, *d_ = nullptr, *rl_ = nullptr,

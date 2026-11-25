@@ -630,11 +630,11 @@ void Inkling::layer_head(Layer& L, int v, int n) {
         m.query = fp(B.attn_query);
         m.n_query = B.swa ? 1 : 3;
         for (int j = 0; j < m.n_query; ++j) m.out[j] = mix_[j];
-        inkling_mix(m, n_embd_, n, norm_eps_, st_);
+        if (!abl(1, n)) inkling_mix(m, n_embd_, n, norm_eps_, st_);
         for (int j = 0; j < 3; ++j) in[j] = mix_[B.swa ? 0 : j];
     }
     // a later pass's messages: the pass before's mix, gated into each input
-    if (B.pass > 0) {
+    if (B.pass > 0 && !abl(2, n)) {
         if (!direct) {
             gather(kBank, bank_, n);
             gather(kBankOut, bank_out_, n);
@@ -665,8 +665,9 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     const int threads = sum_threads(n_embd_);
     const void* q8[3];
     const auto norm = [&](int j, const float* x, const Dev& w) {
-        kernels::native_add_rms_norm_q8_1(const_cast<float*>(x), nullptr, fp(w), in_[j], inq_[j], n_embd_, n,
-                                          rms_eps_, threads, st_);
+        if (!abl(4, n))
+            kernels::native_add_rms_norm_q8_1(const_cast<float*>(x), nullptr, fp(w), in_[j], inq_[j], n_embd_, n,
+                                              rms_eps_, threads, st_);
         q8[j] = inq_[j];
     };
     const float* x[3];
@@ -683,7 +684,7 @@ void Inkling::layer_head(Layer& L, int v, int n) {
         }
     }
     sub_lap("norm", n);
-    attn(B, v, x[0], x[1], x[2], q8, n);
+    if (!abl(8, n)) attn(B, v, x[0], x[1], x[2], q8, n);
     sub_lap("wo", n);
 
     // the first layer of a block starts the stream afresh, and what it started from is the block's
@@ -714,9 +715,9 @@ void Inkling::layer_head(Layer& L, int v, int n) {
                "streams");
             bp[k] = blk_[k];
         }
-        post_conv(o_, post, B.post_conv, cres, n, true, rows_of_);
+        if (!abl(16, n)) post_conv(o_, post, B.post_conv, cres, n, true, rows_of_);
     } else {
-        post_conv(o_, post, B.post_conv, cres, n, false, rows_of_);
+        if (!abl(16, n)) post_conv(o_, post, B.post_conv, cres, n, false, rows_of_);
     }
     sub_lap("post-conv", n);
     dump("ffn_inp", v, cres, n_embd_, n);
@@ -730,9 +731,9 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     m.query = fp(B.ffn_query);
     m.n_query = 1;
     m.out[0] = mix_[0];
-    inkling_mix(m, n_embd_, n, norm_eps_, st_);
+    if (!abl(32, n)) inkling_mix(m, n_embd_, n, norm_eps_, st_);
     float* f = mix_[0];
-    if (B.pass > 0) {
+    if (B.pass > 0 && !abl(32, n)) {
         if (n <= kFusedRows) {
             const InklingCtrl c{f, msg_[3], fp(B.ctrl_down[3]), fp(B.ctrl_gain[3]), fp(B.ctrl_forget[3]), ctl_[0]};
             inkling_control_fused(&c, 1, n_embd_, rank_, n, norm_eps_, ctl_work_, st_);
@@ -742,7 +743,8 @@ void Inkling::layer_head(Layer& L, int v, int n) {
         }
         f = ctl_[0];
     }
-    kernels::native_add_rms_norm_q8_1(f, nullptr, fp(L.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+    if (!abl(32, n))
+        kernels::native_add_rms_norm_q8_1(f, nullptr, fp(L.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
     sub_lap("ffn-mix", n);
     dump("ffn_in", v, xn_, n_embd_, n);
     if (!batched(layers_[(size_t) home_of(v)], n)) moe_router(L, n);   // the experts' layer decides (Layer::alias)
@@ -756,7 +758,7 @@ void Inkling::layer_tail(Layer&, int v, int n) {
     float* const state = B.conv + (size_t) (n_conv_ - 1) * (2 * hk + n_embd_);
     // the stream at this half's rows: a window's halves (shift_rows()) run the other half's head in between
     float* const cres = work_stream(n);
-    post_conv(fo_, state, B.ffn_post_conv, cres, n, false, tail_rows_);
+    if (!abl(16, n)) post_conv(fo_, state, B.ffn_post_conv, cres, n, false, tail_rows_);
     tail_rows_ = nullptr;
     if (cres == res_) scatter(kCur, res_, n);   // several tokens' stream back to r_ (one token's is worked on there)
     dump("l_out", v, cres, n_embd_, n);
@@ -846,6 +848,7 @@ bool Inkling::route_card(int il, int n, int32_t* ids, float* w) {
 
 // No shared expert: the routed experts' sum starts from zero.
 void Inkling::moe_shared(const Layer&, int, int n) {
+    if (abl(64, n)) return;
     ck(DPCT_CHECK_ERROR(
            cs(st_)->memset(fo_, 0, (size_t)n * n_embd_ * sizeof(float))),
        "experts");
