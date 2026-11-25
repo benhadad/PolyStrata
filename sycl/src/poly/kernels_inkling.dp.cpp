@@ -9,8 +9,11 @@
 #include "strata/sycl_queue.hpp"
 #include "strata/poly/inkling_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
+#include "attn_xmx.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <map>
 #include <cstdint>
 #include <cmath>
 #include <stdexcept>
@@ -2636,6 +2639,37 @@ AttnArgs attn_args(const char* who, const float* q, const InklingRel& rel, const
 }
 }  // namespace
 
+// The prompt batch's attention on the matrix units (attn_xmx.hpp), opt-in: STRATA_ATTN_XMX=1.
+static bool xmx_attention() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_ATTN_XMX"); return e && std::atoi(e) != 0; }();
+    return on;
+}
+
+// The relative-position table as halves, transposed and zero-padded ([16][attn_xmx::tt_ld(extent)], column PADL + d
+// holding table[d][j]): rebuilt for each call (a layer's table is its own), into a scratch a queue owns, which the
+// queue's order makes safe to reuse.
+static const sycl::half* rel_table_halves(const dpct::queue_ptr& st, const float* table, int extent) {
+    static std::map<const void*, std::pair<sycl::half*, size_t>> scratch;
+    const int ld = attn_xmx::tt_ld(extent);
+    const size_t need = size_t(16) * ld;
+    auto& e = scratch[st];
+    if (e.second < need) {
+        if (e.first) {
+            st->wait();
+            sycl::free(e.first, *st);
+        }
+        e.first = sycl::malloc_device<sycl::half>(need, *st);
+        if (!e.first) throw std::runtime_error("inkling_attend: no memory for the relative table's halves");
+        e.second = need;
+    }
+    sycl::half* out = e.first;
+    st->parallel_for(sycl::range<1>(need), [=](sycl::id<1> i) {
+        const int j = (int) (i[0] / ld), d = (int) (i[0] % ld) - attn_xmx::PADL;
+        out[i[0]] = sycl::half(d >= 0 && d < extent ? table[(size_t) d * 16 + j] : 0.0f);
+    });
+    return out;
+}
+
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
@@ -2660,6 +2694,32 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
             launch_dec(a, AttnOne{}, rows, kq, vq, int8_dot, st);
             return;
         }
+    }
+    if (rows >= kInklingMmaRows && rel.n_rel == 16 && dim == attn_xmx::DIM && n_head == attn_xmx::PER * kv_heads &&
+        xmx_attention()) {
+        attn_xmx::Args x{};
+        x.q = q;
+        x.kc = a.kc;
+        x.vc = a.vc;
+        x.kcodes = kq8.codes;
+        x.kscales = kq8.scales;
+        x.vcodes = vq8.codes;
+        x.vscales = vq8.scales;
+        x.rel_r = rel.r;
+        x.rel_tt = rel_table_halves(st, rel.table, rel.extent);
+        x.rel_extent = rel.extent;
+        x.sinks = sinks;
+        x.pos = (long long) pos;
+        x.rows = rows;
+        x.n_head = n_head;
+        x.kv_heads = kv_heads;
+        x.window = window;
+        x.ring = ring;
+        x.scale = scale;
+        x.out = out;
+        attn_xmx::launch(x, *st);
+        check_launch("inkling_attend (xmx)");
+        return;
     }
     if (rows >= kInklingMmaRows && rel.n_rel == 16 && mma_attention()) {
         const dpct::dim3 gm(grid(rows, MMA_TOKENS), kv_heads);
