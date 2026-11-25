@@ -36,10 +36,13 @@ int main(int argc, char** argv) {
     int64_t tot = 0;
     for (auto& c : cnt) { c = std::max(1, (int) gd(rng)); tot += c; }
     int fails = 0;
-    struct Case { int ty; bool gu; };
+    struct Case { int ty; bool gu; int64_t K = 0, N = 0; };
     // the formats of the native packs' experts that the prompt path's fused XMX takes (prefill.cpp xmx2_fmt)
-    for (Case cs : {Case{18, true}, Case{21, true}, Case{22, true}, Case{23, true}, Case{20, false}, Case{42, false}}) {
-        const int64_t K = cs.gu ? 2560 : 640, N = cs.gu ? 1280 : 2560, n_ff = 640;
+    // 17 and 11 as the engine runs a prompt batch's gate/up tensor of those types: one matrix of 2 * n_ff_exp rows (Inkling:
+    // 2304 x 2304), not the pair of matrices the other gate/up cases take
+    for (Case cs : {Case{18, true}, Case{21, true}, Case{22, true}, Case{23, true}, Case{20, false}, Case{42, false},
+                    Case{17, false, 2304, 2304}, Case{11, false, 2304, 2304}}) {
+        const int64_t K = cs.K ? cs.K : cs.gu ? 2560 : 640, N = cs.N ? cs.N : cs.gu ? 1280 : 2560, n_ff = 640;
         const int blk_elems = cs.ty == 20 ? 32 : cs.ty == 42 ? 64 : 256;
         const size_t blk_bytes = strata::kernels::iq_row_bytes(cs.ty, blk_elems);
         const size_t mat_bytes = strata::kernels::iq_row_bytes(cs.ty, K) * (cs.gu ? n_ff : N);
@@ -47,7 +50,11 @@ int main(int argc, char** argv) {
         auto blob = [&]() {
             std::vector<uint8_t> b(mat_bytes);
             for (auto& x : b) x = (uint8_t) rng();
-            if (cs.ty != 29)   // d = 0.0625 at each block's start (IQ1_M keeps its scale in the scales field)
+            // d = 0.0625 at each block's start (IQ1_M keeps its scale in the scales field; Q3_K's d is the block's last
+            // two bytes)
+            if (cs.ty == 11)
+                for (size_t o = blk_bytes - 2; o + 1 < b.size(); o += blk_bytes) { b[o] = 0x00; b[o + 1] = 0x2C; }
+            else if (cs.ty != 29)
                 for (size_t o = 0; o + 1 < b.size(); o += blk_bytes) { b[o] = 0x00; b[o + 1] = 0x2C; }
             return b;
         };

@@ -2829,29 +2829,41 @@ inline void dq_iq4_nl(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     }
     store_run<dst_t, 8>(y, v);
 }
-// Q3_K (the Q2_0 file's token_embd): llama.cpp's dequantize_block_q3_K, its 64 threads folded onto 32
+// Q3_K (the Q2_0 file's token_embd): llama.cpp's dequantize_block_q3_K, its 64 threads folded onto 32.  dq_q3_k_part()
+// is one of the 64: 4 values, at 128 n + 32 j + [l0, l0 + 4) of the 256, the 32-block t2 = tt / 8 = 4 n + j.
+template <typename dst_t>
+__dpct_inline__ void dq_q3_k_part(const block_q3_K* x, dst_t *yy, int tt) {
+    const int r = tt / 4, t2 = r / 2, is0 = r % 2;
+    const int l0 = 16 * is0 + 4 * (tt % 4);
+    const int n = t2 / 4, j = t2 - 4 * n;
+    const uint8_t m = (uint8_t) (1 << (4 * n + j));
+    const int is = 8 * n + 2 * j + is0;
+    const int shift = 2 * j;
+    const int8_t us = is < 4  ? (int8_t) ((x->scales[is - 0] & 0xF) | (((x->scales[is + 8] >> 0) & 3) << 4)) :
+                      is < 8  ? (int8_t) ((x->scales[is - 0] & 0xF) | (((x->scales[is + 4] >> 2) & 3) << 4)) :
+                      is < 12 ? (int8_t) ((x->scales[is - 8] >> 4) | (((x->scales[is + 0] >> 4) & 3) << 4)) :
+                                (int8_t) ((x->scales[is - 8] >> 4) | (((x->scales[is - 4] >> 6) & 3) << 4));
+    const float dl = (float) x->d * (us - 32);
+    dst_t* y = yy + 128 * n + 32 * j;
+    const uint8_t* q = x->qs + 32 * n;
+    const uint8_t* hm = x->hmask;
+#pragma unroll
+    for (int l = l0; l < l0 + 4; ++l) y[l] = cvt<dst_t>(
+        dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+}
 template <typename dst_t>
 inline void dq_q3_k(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     const block_q3_K* x = (const block_q3_K*) vx + ibs;
-    for (int tt = tid; tt < 64; tt += 32) {
-        const int r = tt / 4, t2 = r / 2, is0 = r % 2;
-        const int l0 = 16 * is0 + 4 * (tt % 4);
-        const int n = t2 / 4, j = t2 - 4 * n;
-        const uint8_t m = (uint8_t) (1 << (4 * n + j));
-        const int is = 8 * n + 2 * j + is0;
-        const int shift = 2 * j;
-        const int8_t us = is < 4  ? (int8_t) ((x->scales[is - 0] & 0xF) | (((x->scales[is + 8] >> 0) & 3) << 4)) :
-                          is < 8  ? (int8_t) ((x->scales[is - 0] & 0xF) | (((x->scales[is + 4] >> 2) & 3) << 4)) :
-                          is < 12 ? (int8_t) ((x->scales[is - 8] >> 4) | (((x->scales[is + 0] >> 4) & 3) << 4)) :
-                                    (int8_t) ((x->scales[is - 8] >> 4) | (((x->scales[is - 4] >> 6) & 3) << 4));
-        const float dl = (float) x->d * (us - 32);
-        dst_t* y = yy + 128 * n + 32 * j;
-        const uint8_t* q = x->qs + 32 * n;
-        const uint8_t* hm = x->hmask;
-#pragma unroll
-        for (int l = l0; l < l0 + 4; ++l) y[l] = cvt<dst_t>(
-            dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
-    }
+    for (int tt = tid; tt < 64; tt += 32) dq_q3_k_part<dst_t>(x, yy, tt);
+}
+// The grouped XMX kernel's split for the types that are not coalesced runs of 8: thread tid = 8 sub + b writes a
+// quarter (sub) of the 32 values of block b, which here are two of dq_q3_k_part()'s 8 parts of the block.
+template <typename dst_t>
+inline void dq_q3_k_g(const void *vx, int64_t ibs, dst_t *yy, int tid) {
+    const block_q3_K* x = (const block_q3_K*) vx + ibs;
+    const int b = tid % 8, sub = tid / 8;
+    dq_q3_k_part<dst_t>(x, yy, 8 * b + 2 * sub);
+    dq_q3_k_part<dst_t>(x, yy, 8 * b + 2 * sub + 1);
 }
 template <typename dst_t>
 inline void dq_iq4_xs(const void *vx, int64_t ibs, dst_t *yy, int tid) {
@@ -5886,7 +5898,8 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                     const bool run8 = ty == 16 || ty == 17 || ty == 18 || ty == 20 || ty == 21 || ty == 22 ||
                                       ty == 29 || ty == 42 || ty == 40;
                     const int tid = run8 ? (o >> 3) : (sub * 8 + (o32 >> 5));
-                    dq_dispatch<sycl::half>(ty, base, ibs, pb + r * LDB - o32, tid);
+                    if (ty == 11) dq_q3_k_g<sycl::half>(base, ibs, pb + r * LDB - o32, tid);
+                    else dq_dispatch<sycl::half>(ty, base, ibs, pb + r * LDB - o32, tid);
                 }
                 it.barrier(sycl::access::fence_space::local_space);
                 for (int kk = 0; kk < KS; kk += 16) {
