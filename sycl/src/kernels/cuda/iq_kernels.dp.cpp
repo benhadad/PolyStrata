@@ -2884,6 +2884,26 @@ inline void dq_q2_0(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     }
     store_run<dst_t, 8>(yy + b * 64 + part * 8, v);
 }
+// NVFP4 (type 40, ModelOpt): a 64-value block = 4 sub-blocks of 16 (one UE4M3 scale each, halved as in
+// vec_dot_nvfp4_q8_1) whose 8 bytes hold E2M1 codes split-half: value j of a sub-block is the low nibble of byte j
+// for j < 8 and the high nibble of byte j - 8 for j >= 8.  Used by the grouped XMX GEMM only (is_iq() does not take 40).
+// Thread tid writes values [8 tid, 8 tid + 8) of the 256-value superblock.
+__dpct_inline__ float fp4_value_doubled(int nib) {
+    const int m = nib & 7;
+    const int v = m < 5 ? m : (m == 5 ? 6 : (m == 6 ? 8 : 12));
+    return (float) ((nib & 8) ? -v : v);
+}
+template <typename dst_t>
+inline void dq_nvfp4(const void *vx, int64_t ibs, dst_t *yy, int tid) {
+    const block_nvfp4* x = (const block_nvfp4*) vx + ibs * 4;
+    const int b = tid / 8, part = tid % 8, s = part / 2, hi = part & 1;
+    const float d = ue4m3_to_f32_half(x[b].d[s]);
+    const uint8_t* q = x[b].qs + 8 * s;
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = d * fp4_value_doubled(hi ? (q[j] >> 4) : (q[j] & 0xF));
+    store_run<dst_t, 8>(yy + b * 64 + part * 8, v);
+}
 
 // llama.cpp's dequantize_q4_K / dequantize_q5_K (dequantize.cuh; q5_K's 64 threads folded onto 32) and the 32-value
 // blocks of Q5_1 / Q8_0, 8 of them per 256-value "superblock" (thread tid writes 8 values of block tid / 4; it was block
@@ -3081,6 +3101,7 @@ dq_dispatch(int ty, const void *vx, int64_t ibs, dst_t *y, int tid) {
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
+        case 40: dq_nvfp4(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;
         case 13: dq_q5_k(vx, ibs, y, tid); break;
 #ifdef STRATA_Q6K_EXPERTS
@@ -5863,7 +5884,7 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                     // Q2_0 decoders write [8 tid, 8 tid + 8) (coalesced runs); IQ4_XS and the rest keep the
                     // (sub-run, 32-block) split
                     const bool run8 = ty == 16 || ty == 17 || ty == 18 || ty == 20 || ty == 21 || ty == 22 ||
-                                      ty == 29 || ty == 42;
+                                      ty == 29 || ty == 42 || ty == 40;
                     const int tid = run8 ? (o >> 3) : (sub * 8 + (o32 >> 5));
                     dq_dispatch<sycl::half>(ty, base, ibs, pb + r * LDB - o32, tid);
                 }
@@ -5931,7 +5952,7 @@ int fill(Grp& gp, const int32_t* cnt, int n) {
 void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, const int32_t* cnt, int n,
                     const uint16_t* X, float* Y, int N, int K, void* stream) {
     if (n <= 0) return;
-    if (n > kXmxGroupMax || N % 128 != 0 || K % 32 != 0 || !is_iq(ty)) {
+    if (n > kXmxGroupMax || N % 128 != 0 || K % 32 != 0 || !(is_iq(ty) || ty == 40) || (ty == 40 && K % 64 != 0)) {
         std::fprintf(stderr, "iq_xmx_grouped: bad arguments (type %d, n %d, N %d, K %d)\n", ty, n, N, K);
         std::exit(1);
     }

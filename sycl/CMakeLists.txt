@@ -336,6 +336,12 @@ if(STRATA_SYCL_PARITY)
   add_executable(nvfp4_mmvq_parity ${_src})
   target_link_libraries(nvfp4_mmvq_parity PRIVATE strata_kernels)
   add_test(NAME nvfp4_mmvq_parity COMMAND nvfp4_mmvq_parity)
+  # NVFP4 through the grouped XMX GEMM (iq_xmx_grouped, the prompt batch's expert product) vs an FP64 CPU reference
+  # (-DNEG_CONTROL: wrong reference, must fail)
+  strata_resolve(_src src/kernels/xmx_nvfp4_parity.cpp)
+  add_executable(xmx_nvfp4_parity ${_src})
+  target_link_libraries(xmx_nvfp4_parity PRIVATE strata_kernels)
+  add_test(NAME xmx_nvfp4_parity COMMAND xmx_nvfp4_parity)
   # native_mmvq_slots / native_mmvq_ids (several matrices, one launch) against native_mmvq on each matrix, 12 formats
   strata_resolve(_src src/kernels/slots_ids_parity.cpp)
   add_executable(slots_ids_parity ${_src})
@@ -416,7 +422,7 @@ if(STRATA_SYCL_POLY AND STRATA_NATIVE_EXPERTS)
   endif()
   strata_resolve(_poly src/poly/kernels.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu
                        src/poly/engine.cpp src/poly/inkling.cpp src/poly/spill.cpp src/poly/main.cpp)
-  list(APPEND _poly ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/mmq_stub.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/poly_shims.cpp
+  list(APPEND _poly ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/mmq_stub.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/moe_xmx.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/poly_shims.cpp
        ${STRATA_ROOT}/src/poly/cpu_experts.cpp ${STRATA_ROOT}/src/poly/cpu_lowbit.cpp)
   set_source_files_properties(${STRATA_ROOT}/src/poly/cpu_lowbit.cpp PROPERTIES INCLUDE_DIRECTORIES ${_poly_gg}/src)
   add_executable(strata-poly ${_poly})

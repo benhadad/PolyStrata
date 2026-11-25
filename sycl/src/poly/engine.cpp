@@ -17,7 +17,9 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/gpu/metal.hpp"
 #endif
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "moe_xmx.hpp"
 #include "strata/platform/memory.hpp"
 
 #include "ggml.h"
@@ -3345,6 +3347,16 @@ void Engine::alloc() {
         d_ids_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
         d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
         d_slots_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
+        const char* xe = std::getenv("STRATA_MOE_XMX");
+        xmx_on_ = xe && std::atoi(xe) != 0 && rows_ >= kStageRows;
+        if (xmx_on_) {   // a prompt batch's picks, sorted by expert, through the grouped XMX products
+            xmx_xh_ = (uint16_t*) dmalloc(rr * n_embd_ * sizeof(uint16_t), "scratch");
+            xmx_yg_ = (float*) dmalloc(rr * 2 * n_ff_exp_ * sizeof(float), "scratch");
+            xmx_hf_ = (float*) dmalloc(rr * n_ff_exp_ * sizeof(float), "scratch");
+            xmx_h16_ = (uint16_t*) dmalloc(rr * n_ff_exp_ * sizeof(uint16_t), "scratch");
+            xmx_yd_ = (float*) dmalloc(rr * n_embd_ * sizeof(float), "scratch");
+            xmx_idx_ = (int32_t*) dmalloc(3 * rr * sizeof(int32_t), "scratch");
+        }
     }
     if (mmq_) {
         const size_t rr = n * n_used_,
@@ -3922,7 +3934,7 @@ void Engine::moe_router(const Layer& L, int n) {
     // A layer routed on the card reads neither copy (moe() is not called), so they and the next layer's read-ahead
     // would only be a device-to-host transfer a layer.  The first visit of a layer still copies: Layer::card is not
     // known before moe_card() has run.
-    if (card_visit(L, n)) return;
+    if (card_visit(L, n) || xmx_layer(layers_[(size_t) home_of((int) (&L - layers_.data()))], n)) return;
     copy2(rl_, h_rl_, n * n_expert_, xn_, h_x_, n * n_embd_, st_);
     if (prefetch_k_ <= 0 || block_pass_ || n > 16) return;
     size_t part = 0;
@@ -4615,6 +4627,77 @@ bool Engine::card_moe(int n) {
         ck(gpu::metal::register_indirect(d_slots_, h_slots_.data(), h_slots_.size()), "expert dependencies");
 #endif
     }
+    return true;
+}
+
+// The expert matrix types and widths the grouped XMX kernel decodes (iq_xmx_grouped): the ones its tests cover.
+static bool xmx_type(int t, int k) {
+    int qk;
+    switch (t) {
+        case 18: case 21: case 22: case 23: qk = 256; break;   // IQ3_XXS, IQ3_S, IQ2_S, IQ4_XS
+        case 20: qk = 32; break;                               // IQ4_NL
+        case 40: case 42: qk = 64; break;                      // NVFP4, Q2_0
+        default: return false;
+    }
+    return k % qk == 0;
+}
+
+bool Engine::xmx_layer(const Layer& M, int n) const {
+    return xmx_on_ && n >= kStageRows && n <= rows_ && all_cached() && !opt_.dump && !M.mixed() && !block_pass_ &&
+           xmx_type((int) M.gu_type, n_embd_) && xmx_type((int) M.d_type, n_ff_exp_) && (2 * n_ff_exp_) % 128 == 0 &&
+           n_embd_ % 128 == 0;
+}
+
+// A prompt batch's routed experts for a layer with every expert in VRAM: the picks are routed on the card, sorted by
+// expert on the host (one wait for the ids), and each expert's rows go through gate/up and down as grouped XMX
+// products (fp16 activations, the weights decoded from their quantized blocks into local memory); the experts' sum
+// is added in each token's pick order, as moe_sum() does.
+bool Engine::moe_xmx(Layer& L, int il, int n) {
+    const int rr = n * n_used_, ne = n_expert_, ff = n_ff_exp_;
+    if (!route_card(il, n, d_ids_, d_wts_)) return false;
+    std::vector<int32_t> ids((size_t) rr);
+    ck(DPCT_CHECK_ERROR(cs(st_)->memcpy(ids.data(), d_ids_, (size_t) rr * sizeof(int32_t)).wait()), "xmx experts");
+    std::vector<int32_t> cnt((size_t) ne, 0), fill((size_t) ne, 0), idx((size_t) 3 * rr);
+    for (int p = 0; p < rr; ++p) {
+        if (ids[(size_t) p] < 0 || ids[(size_t) p] >= ne) throw std::runtime_error("xmx experts: a pick is out of range");
+        ++cnt[(size_t) ids[(size_t) p]];
+    }
+    for (int e = 1; e < ne; ++e) fill[(size_t) e] = fill[(size_t) e - 1] + cnt[(size_t) e - 1];
+    int32_t *tok = idx.data(), *esort = tok + rr, *pos = esort + rr;
+    for (int p = 0; p < rr; ++p) {
+        const int e = ids[(size_t) p], q = fill[(size_t) e]++;
+        pos[p] = q;
+        tok[q] = p / n_used_;
+        esort[q] = e;
+    }
+    h2d_copy(xmx_idx_, idx.data(), idx.size() * sizeof(int32_t));
+    // the sorted rows of an expert-by-expert product, up to kXmxGroupMax experts a launch
+    const auto grouped = [&](int ty, size_t slot_off, const uint16_t* x, float* y, int n_out, int k) {
+        int done = 0;
+        for (int e = 0; e < ne;) {
+            const uint8_t* a[kernels::kXmxGroupMax];
+            int32_t c[kernels::kXmxGroupMax];
+            int m = 0, rows = 0;
+            for (; e < ne && m < kernels::kXmxGroupMax; ++e) {
+                if (cnt[(size_t) e] == 0) continue;
+                a[m] = L.slot[(size_t) e] + slot_off;
+                c[m++] = cnt[(size_t) e];
+                rows += cnt[(size_t) e];
+            }
+            if (m == 0) break;
+            kernels::iq_xmx_grouped(ty, a, nullptr, c, m, x + (size_t) done * k, y + (size_t) done * n_out, n_out, k, st_);
+            done += rows;
+        }
+    };
+    xmx::gather_f16(xn_, n_embd_, xmx_idx_, rr, n_embd_, xmx_xh_, st_);
+    grouped((int) L.gu_type, 0, xmx_xh_, xmx_yg_, 2 * ff, n_embd_);
+    const ExpertScales es = expert_scales(L, xmx_idx_ + rr);
+    act_rows(xmx_yg_, xmx_hf_, rr, clamp_exp_[(size_t) il], &es);
+    xmx::f32_to_f16(xmx_hf_, xmx_h16_, (size_t) rr * ff, st_);
+    grouped((int) L.d_type, L.gu2(), xmx_h16_, xmx_yd_, n_embd_, ff);
+    if (!L.h_s_down.empty()) expert_weights(d_wts_, fp(L.s_down), d_ids_, rr, st_);
+    xmx::sum_perm(xmx_yd_, xmx_idx_ + 2 * rr, d_wts_, fo_, n_embd_, n_used_, n, st_);
+    stats_.gpu_experts += rr;
     return true;
 }
 
@@ -5487,16 +5570,36 @@ void Engine::run(const int32_t* tokens, int n) {
         for (int il = lo_; il < hi_; ++il) stats_.gpu_experts += routed(layers_[(size_t) il]) ? n * n_used_ : 0;
         return;
     }
+    // STRATA_STAGE_PROF=1: wait for the card after each part of a layer of a prompt batch and add up the times
+    // (printed once a call of kStageRows tokens or more is through).  Diagnostic: the waits themselves cost a little.
+    static const bool prof = std::getenv("STRATA_STAGE_PROF") != nullptr;
+    const bool timed = prof && n >= kStageRows;
+    double t_up = 0, t_moe = 0, t_tail = 0, t_nonrouted = 0;
+    const auto lap = [&](double& acc, Clock::time_point& t) {
+        if (!timed) return;
+        ck(DPCT_CHECK_ERROR(cs(st_)->wait_and_throw()), "stage profile");
+        acc += ms_since(t);
+        t = Clock::now();
+    };
+    Clock::time_point tp = Clock::now();
     for (int il = lo_; il < hi_; ++il) {
         Layer& L = layers_[(size_t) il];
         up(il, n, (size_t) n - 1);
-        if (!routed(L)) continue;
+        if (!routed(L)) { lap(t_nonrouted, tp); continue; }
+        lap(t_up, tp);
         const int home = home_of(il);
         Layer& M = layers_[(size_t) home];   // the layer whose experts L runs: L, or its Layer::alias
         if (batched(M, n)) moe_rows(M, home, n);
-        else if (!on_card(il, n, (size_t) n - 1) && moe(il, n)) moe_add(n);
+        else if (xmx_layer(M, n)) {
+            if (!moe_xmx(M, home, n)) throw std::runtime_error("xmx experts: the layer is not routed on the card");
+        } else if (!on_card(il, n, (size_t) n - 1) && moe(il, n)) moe_add(n);
+        lap(t_moe, tp);
         tail(il, n, (size_t) n - 1);
+        lap(t_tail, tp);
     }
+    if (timed)
+        std::fprintf(stderr, "stage-prof n=%d: head+shared %.1f ms, experts %.1f ms, tail %.1f ms, unrouted layers %.1f ms" "\n", n,
+                     t_up, t_moe, t_tail, t_nonrouted);
 }
 
 // A row a sequence.  A layer's head is the sequence's own: its row of the buffers (shift_rows()) with the sequence

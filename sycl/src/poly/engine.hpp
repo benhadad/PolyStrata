@@ -601,6 +601,10 @@ protected:
     int card_rows() const;
     /// Whether moe_router()'s call of n tokens at layer L is routed on the card (moe_card()), so its host copies are not read.
     bool card_visit(const Layer& L, int n) const;
+    /// A prompt batch's routed experts as grouped XMX products (moe_xmx()): every expert in VRAM, formats the grouped
+    /// kernel decodes.  Needs STRATA_MOE_XMX=1.
+    bool xmx_layer(const Layer& M, int n) const;
+    bool moe_xmx(Layer& L, int il, int n);
     void moe_add(int n);
     template <class F>
     void* record(F&& work);
@@ -910,6 +914,10 @@ protected:
     int32_t* d_ids_ = nullptr;                    ///< a batch's experts and weights when it routes on the card
     float* d_wts_ = nullptr;
     int32_t* h_ids_ = nullptr;                    ///< pinned: the experts, back from the card
+    bool xmx_on_ = false;                         ///< STRATA_MOE_XMX: the buffers below exist
+    uint16_t *xmx_xh_ = nullptr, *xmx_h16_ = nullptr;   ///< fp16 inputs of the grouped products: the experts' rows, then their activations
+    float *xmx_yg_ = nullptr, *xmx_hf_ = nullptr, *xmx_yd_ = nullptr;   ///< gate/up out, the activation's out, down out (per pick)
+    int32_t* xmx_idx_ = nullptr;                  ///< 3 x picks: each sorted row's token, its expert, and each pick's sorted row
     void** d_slots_ = nullptr;                    ///< every layer's L.slot on the card, n_expert_ a layer (moe_card())
     std::vector<void*> h_slots_;                  ///< what d_slots_ holds
     uint8_t* stage_ = nullptr;                    ///< experts that are not cached, on their way through VRAM
