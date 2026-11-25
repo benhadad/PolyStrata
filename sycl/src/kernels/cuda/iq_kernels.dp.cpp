@@ -2905,6 +2905,22 @@ __dpct_inline__ float fp4_value_doubled(int nib) {
     const int v = m < 5 ? m : (m == 5 ? 6 : (m == 6 ? 8 : 12));
     return (float) ((nib & 8) ? -v : v);
 }
+// One 16-value sub-block of an NVFP4 block (values 0..7 the low nibbles of its 8 bytes, 8..15 the high ones) from the
+// words it was loaded as: what dq_nvfp4() writes for the two threads of the sub-block, with the bytes read as two 32-bit
+// words (the qs of a 36-byte block start at a multiple of 4) instead of eight bytes each.
+__dpct_inline__ void nvfp4_sub16(uint8_t dbyte, uint32_t q0, uint32_t q1, sycl::half *y) {
+    const float d = ue4m3_to_f32_half(dbyte);
+    float lo[8], hi[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        lo[j] = d * fp4_value_doubled((q0 >> (8 * j)) & 0xF);
+        hi[j] = d * fp4_value_doubled((q0 >> (8 * j + 4)) & 0xF);
+        lo[4 + j] = d * fp4_value_doubled((q1 >> (8 * j)) & 0xF);
+        hi[4 + j] = d * fp4_value_doubled((q1 >> (8 * j + 4)) & 0xF);
+    }
+    store_run<sycl::half, 8>(y, lo);
+    store_run<sycl::half, 8>(y + 8, hi);
+}
 template <typename dst_t>
 inline void dq_nvfp4(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     const block_nvfp4* x = (const block_nvfp4*) vx + ibs * 4;
@@ -5850,7 +5866,7 @@ struct Cfg {
 // STRATA_XG_DBG): bit 0 skips the weights' decode, bit 1 the matrix products, bit 2 the activations' load.
 template <class C, class Name, int TY = -1, bool G256 = true>
 void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, const Grp& gp, int ntiles, int N, int K,
-            int dbg = 0) {
+            int dbg = 0, int nv = 0) {
     constexpr int BM = C::BM, BN = C::BN, KS = C::KS, WG = C::WG, SG = C::SG;
     constexpr int LDA = KS + 8, LDB = KS + 8;
     const int nb = N / BN;
@@ -5879,6 +5895,43 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                 for (int j = 0; j < C::NT; ++j) jm::joint_matrix_fill(sg, acc[i][j], 0.0f);
             sycl::half* pa = sa.template get_multi_ptr<sycl::access::decorated::no>().get();
             sycl::half* pb = sb.template get_multi_ptr<sycl::access::decorated::no>().get();
+            // NVFP4 (TY 40), nv 1: a thread takes whole 16-value sub-blocks (KS / 16 a row), its 8 bytes as two 32-bit
+            // words and the scale byte: 1.6 to 1.7 times faster than the byte loads of the generic decoder (xmx_group_bench).
+            // Loading the next K step's words ahead of the products (tried) was slower.
+            constexpr int T16 = KS / 16, TPT = (BN * T16 + WG - 1) / WG;
+            uint32_t rq0[TPT], rq1[TPT], rdb[TPT];
+            const auto nv_fetch = [&](int kk0) {
+                if constexpr (TY == 40) {
+#pragma unroll
+                    for (int i = 0; i < TPT; ++i) {
+                        const int v = lid + i * WG;
+                        if (v < BN * T16) {
+                            const int r = v / T16, t = v % T16, nr = n0 + r;
+                            const uint8_t* base = gu ? ((nr & 1) ? wb : wa) : wa;
+                            const int64_t row = gu ? (nr >> 1) : nr;
+                            const int64_t kk = kk0 + 16 * t;
+                            const block_nvfp4* blk = (const block_nvfp4*) base + (row * (K / 64) + (kk >> 6));
+                            const int sb16 = (int) ((kk >> 4) & 3);
+                            const uint32_t* qp = reinterpret_cast<const uint32_t*>(blk->qs + 8 * sb16);
+                            rq0[i] = qp[0];
+                            rq1[i] = qp[1];
+                            rdb[i] = blk->d[sb16];
+                        }
+                    }
+                }
+            };
+            const auto nv_store = [&]() {
+                if constexpr (TY == 40) {
+#pragma unroll
+                    for (int i = 0; i < TPT; ++i) {
+                        const int v = lid + i * WG;
+                        if (v < BN * T16) {
+                            const int r = v / T16, t = v % T16;
+                            nvfp4_sub16((uint8_t) rdb[i], rq0[i], rq1[i], pb + r * LDB + 16 * t);
+                        }
+                    }
+                }
+            };
             for (int k0 = 0; k0 < K; k0 += KS) {
                 constexpr int VA = BM * KS / 8;
                 if (!(dbg & 4))
@@ -5889,7 +5942,13 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                     *reinterpret_cast<sycl::vec<sycl::half, 8>*>(pa + r * LDA + c) = x;
                 }
                 // B: row r of the tile, KS values from k0 = KS / 8 runs of 8, each one thread of the format's decoder
-                if (!(dbg & 1))
+                if constexpr (TY == 40) {
+                    if (nv >= 1 && !(dbg & 1)) {
+                        nv_fetch(k0);
+                        nv_store();
+                    }
+                }
+                if (!(dbg & 1) && !(TY == 40 && nv >= 1))
                 for (int v = lid; v < BN * (KS / 8); v += WG) {
                     const int r = v / (KS / 8), t8 = v % (KS / 8), c32 = t8 >> 2, sub = t8 & 3, nr = n0 + r;
                     const uint8_t* base = gu ? ((nr & 1) ? wb : wa) : wa;
@@ -5980,9 +6039,9 @@ int fill(Grp& gp, const int32_t* cnt, int n) {
 // one configuration, the kernel of the format when `spec` and it has one of its own
 template <class C>
 void go(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, Grp& gp, const int32_t* cnt, int n, int N, int K,
-        bool spec, int dbg) {
+        bool spec, int dbg, int nv) {
     const int nt = fill<C>(gp, cnt, n);
-    if (spec && ty == 40) launch<C, k_xg<C, 40, true>, 40, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
+    if (spec && ty == 40) launch<C, k_xg<C, 40, true>, 40, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg, nv);
     else if (spec && ty == 18) launch<C, k_xg<C, 18, true>, 18, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
     else if (spec && ty == 20) launch<C, k_xg<C, 20, true>, 20, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
     else launch<C, k_xg<C, -1, true>, -1, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
@@ -6012,13 +6071,15 @@ void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, co
     static const int env_spec = [] { const char* e = std::getenv("STRATA_XG_SPEC"); return e ? std::atoi(e) : 1; }();
     static const int env_cfg = [] { const char* e = std::getenv("STRATA_XG_CFG"); return e ? std::atoi(e) : -1; }();
     static const int env_dbg = [] { const char* e = std::getenv("STRATA_XG_DBG"); return e ? std::atoi(e) : 0; }();
+    // STRATA_XG_NV=0: NVFP4 through the generic decoder (byte loads) instead of the loader of its own
+    static const int env_nv = [] { const char* e = std::getenv("STRATA_XG_NV"); return e ? std::atoi(e) : 1; }();
 #ifdef STRATA_XMX_SG16
     const int cfg = env_cfg >= 0 ? env_cfg : 0;
 #else
     const int cfg = env_cfg >= 0 ? env_cfg : (tot / n < 96 ? 0 : 1);
 #endif
-    if (cfg == 0) xmxg::go<xmxg::Small>(q, ty, gu, Xh, Y, gp, cnt, n, N, K, env_spec != 0, env_dbg);
-    else xmxg::go<xmxg::Big>(q, ty, gu, Xh, Y, gp, cnt, n, N, K, env_spec != 0, env_dbg);
+    if (cfg == 0) xmxg::go<xmxg::Small>(q, ty, gu, Xh, Y, gp, cnt, n, N, K, env_spec != 0, env_dbg, env_nv);
+    else xmxg::go<xmxg::Big>(q, ty, gu, Xh, Y, gp, cnt, n, N, K, env_spec != 0, env_dbg, env_nv);
     check("iq_xmx_grouped");
 }
 
