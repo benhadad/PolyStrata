@@ -5841,13 +5841,16 @@ struct Grp {
     int tstart[kXmxGroupMax + 1];
     int n;
 };
-template <int SGM_, int SGN_, int MT_, int NT_>
+template <int SGM_, int SGN_, int MT_, int NT_, int KS_ = 32>
 struct Cfg {
-    static constexpr int SGM = SGM_, SGN = SGN_, MT = MT_, NT = NT_, KS = 32, SG = kSgW;
+    static constexpr int SGM = SGM_, SGN = SGN_, MT = MT_, NT = NT_, KS = KS_, SG = kSgW;
     static constexpr int BM = SGM * MT * 8, BN = SGN * NT * kSgW, WG = SGM * SGN * kSgW;
 };
-template <class C, class Name>
-void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, const Grp& gp, int ntiles, int N, int K) {
+// TY >= 0: the format is a template constant (one decoder in the kernel); -1: ty, read at run time.  dbg (diagnostic,
+// STRATA_XG_DBG): bit 0 skips the weights' decode, bit 1 the matrix products, bit 2 the activations' load.
+template <class C, class Name, int TY = -1, bool G256 = true>
+void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, const Grp& gp, int ntiles, int N, int K,
+            int dbg = 0) {
     constexpr int BM = C::BM, BN = C::BN, KS = C::KS, WG = C::WG, SG = C::SG;
     constexpr int LDA = KS + 8, LDB = KS + 8;
     const int nb = N / BN;
@@ -5856,8 +5859,8 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<sycl::half, 1> sa(BM * LDA, h), sb(BN * LDB, h);
         auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
-        h.parallel_for<Name>(sycl::nd_range<2>({(size_t) ntiles, (size_t) nb * WG}, {1, (size_t) WG}), props,
-                             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kSgW)]] {
+        const auto range = sycl::nd_range<2>({(size_t) ntiles, (size_t) nb * WG}, {1, (size_t) WG});
+        auto body = [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kSgW)]] {
             auto sg = it.get_sub_group();
             const int t = (int) it.get_group(0);
             int e = 0;
@@ -5878,30 +5881,42 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
             sycl::half* pb = sb.template get_multi_ptr<sycl::access::decorated::no>().get();
             for (int k0 = 0; k0 < K; k0 += KS) {
                 constexpr int VA = BM * KS / 8;
+                if (!(dbg & 4))
                 for (int v = lid; v < VA; v += WG) {
                     const int r = v / (KS / 8), c = (v % (KS / 8)) * 8;
                     sycl::vec<sycl::half, 8> x(0);
                     if (r < rows) x = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(Xe + (size_t) r * K + k0 + c);
                     *reinterpret_cast<sycl::vec<sycl::half, 8>*>(pa + r * LDA + c) = x;
                 }
-                // B: row r of the tile, 32 values from k0 = 4 runs of 8, each one thread of the format's decoder
-                for (int v = lid; v < BN * 4; v += WG) {
-                    const int r = v >> 2, sub = v & 3, nr = n0 + r;
+                // B: row r of the tile, KS values from k0 = KS / 8 runs of 8, each one thread of the format's decoder
+                if (!(dbg & 1))
+                for (int v = lid; v < BN * (KS / 8); v += WG) {
+                    const int r = v / (KS / 8), t8 = v % (KS / 8), c32 = t8 >> 2, sub = t8 & 3, nr = n0 + r;
                     const uint8_t* base = gu ? ((nr & 1) ? wb : wa) : wa;
                     const int64_t row = gu ? (nr >> 1) : nr;
-                    const int64_t flat = row * K + k0;            // a multiple of 32
+                    const int64_t flat = row * K + k0 + 32 * c32;   // a multiple of 32
                     const int64_t ibs = flat >> 8;
                     const int o32 = (int) (flat & 255), o = o32 + 8 * sub;
+                    sycl::half* dst = pb + r * LDB + 32 * c32 - o32;
                     // the decoder thread that writes values [o, o + 8) of the superblock: the IQ2/IQ3/IQ4_NL/IQ1_M and
                     // Q2_0 decoders write [8 tid, 8 tid + 8) (coalesced runs); IQ4_XS and the rest keep the
                     // (sub-run, 32-block) split
-                    const bool run8 = ty == 16 || ty == 17 || ty == 18 || ty == 20 || ty == 21 || ty == 22 ||
-                                      ty == 29 || ty == 42 || ty == 40;
-                    const int tid = run8 ? (o >> 3) : (sub * 8 + (o32 >> 5));
-                    if (ty == 11) dq_q3_k_g<sycl::half>(base, ibs, pb + r * LDB - o32, tid);
-                    else dq_dispatch<sycl::half>(ty, base, ibs, pb + r * LDB - o32, tid);
+                    if constexpr (TY >= 0) {
+                        constexpr bool run8 = TY == 16 || TY == 17 || TY == 18 || TY == 20 || TY == 21 || TY == 22 ||
+                                              TY == 29 || TY == 42 || TY == 40;
+                        const int tid = run8 ? (o >> 3) : (sub * 8 + (o32 >> 5));
+                        if constexpr (TY == 11) dq_q3_k_g<sycl::half>(base, ibs, dst, tid);
+                        else dq_dispatch<sycl::half>(TY, base, ibs, dst, tid);
+                    } else {
+                        const bool run8 = ty == 16 || ty == 17 || ty == 18 || ty == 20 || ty == 21 || ty == 22 ||
+                                          ty == 29 || ty == 42 || ty == 40;
+                        const int tid = run8 ? (o >> 3) : (sub * 8 + (o32 >> 5));
+                        if (ty == 11) dq_q3_k_g<sycl::half>(base, ibs, dst, tid);
+                        else dq_dispatch<sycl::half>(ty, base, ibs, dst, tid);
+                    }
                 }
                 it.barrier(sycl::access::fence_space::local_space);
+                if (!(dbg & 2))
                 for (int kk = 0; kk < KS; kk += 16) {
                     jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> am[C::MT];
                     jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, TN, jm::layout::col_major> bm[C::NT];
@@ -5937,7 +5952,9 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                     }
                 }
             }
-        });
+        };
+        if constexpr (G256) h.parallel_for<Name>(range, props, body);   // 256 registers a thread, half the threads
+        else h.parallel_for<Name>(range, body);
     });
 #else
     (void) q; (void) X; (void) Y; (void) gp; (void) ntiles; (void) N; (void) K;
@@ -5945,7 +5962,7 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
     std::exit(1);
 #endif
 }
-class k_xg_small; class k_xg_big;
+template <class C, int TY, bool G256> class k_xg;
 #ifdef STRATA_XMX_SG16
 using Small = Cfg<2, 4, 4, 2>;   // 64 x 128 (8 sub-groups of 16)
 using Big = Cfg<4, 2, 4, 4>;     // 128 x 128
@@ -5959,6 +5976,16 @@ int fill(Grp& gp, const int32_t* cnt, int n) {
     for (int i = 0; i < n; ++i) { gp.off[i] = o; gp.tstart[i] = t; o += cnt[i]; t += (cnt[i] + C::BM - 1) / C::BM; }
     gp.off[n] = o; gp.tstart[n] = t; gp.n = n;
     return t;
+}
+// one configuration, the kernel of the format when `spec` and it has one of its own
+template <class C>
+void go(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, Grp& gp, const int32_t* cnt, int n, int N, int K,
+        bool spec, int dbg) {
+    const int nt = fill<C>(gp, cnt, n);
+    if (spec && ty == 40) launch<C, k_xg<C, 40, true>, 40, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
+    else if (spec && ty == 18) launch<C, k_xg<C, 18, true>, 18, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
+    else if (spec && ty == 20) launch<C, k_xg<C, 20, true>, 20, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
+    else launch<C, k_xg<C, -1, true>, -1, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
 }
 }  // namespace xmxg
 
@@ -5976,13 +6003,22 @@ void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, co
     sycl::queue& q = *strata::q_of(stream);
     const auto* Xh = reinterpret_cast<const sycl::half*>(X);
     const bool gu = b != nullptr;
-    if (tot / n < 96) {
-        const int nt = xmxg::fill<xmxg::Small>(gp, cnt, n);
-        xmxg::launch<xmxg::Small, xmxg::k_xg_small>(q, ty, gu, Xh, Y, gp, nt, N, K);
-    } else {
-        const int nt = xmxg::fill<xmxg::Big>(gp, cnt, n);
-        xmxg::launch<xmxg::Big, xmxg::k_xg_big>(q, ty, gu, Xh, Y, gp, nt, N, K);
-    }
+    // The tile: 64 rows of an expert x 128 columns, always on this card (Battlemage, STRATA_XMX_SG16): the 128-row tile
+    // was 2 to 3 times slower at every rows an expert measured (xmx_group_bench: 32 to 256).  The 8x8x16 / sub-group 8
+    // build (A770) keeps its rule: 64 rows below 96 an expert, else 128.
+    // STRATA_XG_SPEC=0: the kernel that reads the format at run time for NVFP4, IQ3_XXS and IQ4_NL too (the default is a
+    // kernel of its own for each, 12 to 17% faster); STRATA_XG_CFG (0: 64-row tiles, 1: 128-row); STRATA_XG_DBG (a
+    // diagnostic bit mask, see xmxg::launch()).
+    static const int env_spec = [] { const char* e = std::getenv("STRATA_XG_SPEC"); return e ? std::atoi(e) : 1; }();
+    static const int env_cfg = [] { const char* e = std::getenv("STRATA_XG_CFG"); return e ? std::atoi(e) : -1; }();
+    static const int env_dbg = [] { const char* e = std::getenv("STRATA_XG_DBG"); return e ? std::atoi(e) : 0; }();
+#ifdef STRATA_XMX_SG16
+    const int cfg = env_cfg >= 0 ? env_cfg : 0;
+#else
+    const int cfg = env_cfg >= 0 ? env_cfg : (tot / n < 96 ? 0 : 1);
+#endif
+    if (cfg == 0) xmxg::go<xmxg::Small>(q, ty, gu, Xh, Y, gp, cnt, n, N, K, env_spec != 0, env_dbg);
+    else xmxg::go<xmxg::Big>(q, ty, gu, Xh, Y, gp, cnt, n, N, K, env_spec != 0, env_dbg);
     check("iq_xmx_grouped");
 }
 
