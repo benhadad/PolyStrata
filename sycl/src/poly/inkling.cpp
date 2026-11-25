@@ -487,7 +487,9 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
                             {&B.wrel, xq, rel_, xq8[0]}, {&B.wsink, xq, sink_, xq8[0]},
                             {&B.wk, xk, kraw_, xq8[1]},  {&B.wv, xv, vraw_, xq8[2]},
                             {&B.k_conv_proj, xk, ktap_, xq8[1]}, {&B.v_conv_proj, xv, vtap_, xq8[2]}};
+    sub_lap("pre-proj", n);
     lin_jobs(proj, B.swa ? 6 : 8, n);
+    sub_lap("qkv-proj", n);
     const size_t v_at = (size_t) (n_conv_ - 1) * hk;   // the V convolution's state, after K's
     const InklingTau tau = B.swa ? InklingTau{} : InklingTau{tau_alpha_, tau_floor_};
     InklingClipJob jobs[2];
@@ -527,10 +529,13 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
     } else {
         conv_snaps(kraw_, B.conv, hk, n);
         conv_snaps(vraw_, B.conv + v_at, hk, n);
+        sub_lap("conv-snaps", n);
         inkling_kv_store(kraw_, vraw_, B.conv, B.conv + v_at, fp(B.k_conv), fp(B.v_conv), B.swa ? nullptr : ktap_,
                          B.swa ? nullptr : vtap_, n_kv_, head_dim_, n, qk_clip_, rms_eps_, kv_dst(q8(), B.plane, ring),
                          pos_, k_, v_, st_);
+        sub_lap("kv-store", n);
         inkling_clip_many(jobs, 2, n, pos_, st_);
+        sub_lap("clip", n);
         dump("Qcur", v, q_, hq, n);
         dump("Kcur", v, k_, hk, n);
         dump("Vcur", v, v_, hk, n);
@@ -538,9 +543,11 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
         const InklingAttnSeq c = attn_seq(q8(), B.plane, pos_, attn_room(B, n));
         inkling_attend(q_, c.kcache, c.vcache, c.kq8, c.vq8, rel, sink_, pos_, n, att_, head_dim_, n_head_, n_kv_,
                        scale, window, ring, awork_, awork_n_, st_, c.room, int8_dot_);
+        sub_lap("attend", n);
     }
     dump("kqv_out", v, att_, hq, n);
     mul_sigmoid(att_, gate_, hq, n, hq, false, st_);
+    sub_lap("gate", n);
     lin(B.wo, att_, o_, n);   // the post-convolution: layer_head(), with the residual
 }
 
@@ -599,6 +606,7 @@ void Inkling::layer_head(Layer& L, int v, int n) {
         }
         if (!direct) gather(kCur, res_, n);
     }
+    sub_lap("stream-in", n);
     dump("l_in", v, cres, n_embd_, n);
     const int nb = blocks_before(ip);
     const float* bp[4];   // the blocks' starts
@@ -653,6 +661,7 @@ void Inkling::layer_head(Layer& L, int v, int n) {
             }
         }
     }
+    sub_lap("mix-ctrl", n);
     const int threads = sum_threads(n_embd_);
     const void* q8[3];
     const auto norm = [&](int j, const float* x, const Dev& w) {
@@ -673,7 +682,9 @@ void Inkling::layer_head(Layer& L, int v, int n) {
             x[j] = in_[j];
         }
     }
+    sub_lap("norm", n);
     attn(B, v, x[0], x[1], x[2], q8, n);
+    sub_lap("wo", n);
 
     // the first layer of a block starts the stream afresh, and what it started from is the block's
     float* const post = B.conv + (size_t) 2 * (n_conv_ - 1) * n_kv_ * head_dim_;   // the attention-out's state
@@ -707,6 +718,7 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     } else {
         post_conv(o_, post, B.post_conv, cres, n, false, rows_of_);
     }
+    sub_lap("post-conv", n);
     dump("ffn_inp", v, cres, n_embd_, n);
 
     // the FFN's input: the stream mixed with the blocks, gated with its message in a later pass
@@ -731,6 +743,7 @@ void Inkling::layer_head(Layer& L, int v, int n) {
         f = ctl_[0];
     }
     kernels::native_add_rms_norm_q8_1(f, nullptr, fp(L.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+    sub_lap("ffn-mix", n);
     dump("ffn_in", v, xn_, n_embd_, n);
     if (!batched(layers_[(size_t) home_of(v)], n)) moe_router(L, n);   // the experts' layer decides (Layer::alias)
 }

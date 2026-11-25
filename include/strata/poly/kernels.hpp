@@ -23,6 +23,8 @@ void gemv_bf16(const uint16_t* w, const float* x, float* y, int n_in, int n_out,
 /// for each group of rows_per_x outputs.  It sums in another order than gemv_f32, so a row does not come out
 /// to the last bit as it does there.  Throws std::runtime_error.
 void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows_per_x, int rows);
+/// y[rows][n_out] = x[rows][n_in] w^T for fp16 w (n_out x n_in) and x, in fp32: one oneMKL half product on the matrix units.
+void gemm_f16w(void* blas, const uint16_t* w, const uint16_t* x, float* y, int n_in, int n_out, int rows);
 /// n BF16 values as floats, for gemm_f32.
 void bf16_to_f32(const uint16_t* w, float* out, size_t n, void* stream);
 /// Before a Q8_1 quantization whose blocks keep their sums in halves (llama.cpp's MMQ for Q4_K, Q5_K, Q2_K, Q4_1,

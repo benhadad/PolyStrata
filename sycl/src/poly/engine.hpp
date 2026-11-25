@@ -604,6 +604,9 @@ protected:
     /// A prompt batch's routed experts as grouped XMX products (moe_xmx()): every expert in VRAM, formats the grouped
     /// kernel decodes.  Needs STRATA_MOE_XMX=1.
     bool xmx_layer(const Layer& M, int n) const;
+    void sub_lap(const char* name, int n);   ///< STRATA_STAGE_PROF=2: wait, add the time since the last lap to `name`
+    std::vector<std::pair<std::string, double>> sub_ms_;
+    std::chrono::steady_clock::time_point sub_t_{};
     bool moe_xmx(Layer& L, int il, int n);
     void moe_add(int n);
     template <class F>
@@ -892,6 +895,9 @@ protected:
 
     // device scratch: a layer's input streams, one stream, the normed input, the attention's and the FFN's output
     float *r_ = nullptr, *cur_ = nullptr, *xn_ = nullptr, *ao_ = nullptr, *fo_ = nullptr;
+    bool proj_on_ = false;                        ///< STRATA_PROJ_XMX: a prompt batch's dense projections as fp16 products
+    uint16_t *proj_w16_ = nullptr, *proj_x16_ = nullptr;   ///< the weight dequantized, the batch's input as halves
+    size_t proj_w_max_ = 0, proj_x_max_ = 0;      ///< their sizes in values
     float* wf_ = nullptr;      ///< the largest BF16 matrix as floats: lin() multiplies a prompt batch by cuBLAS
     size_t bf16_max_ = 0;      ///< that matrix's values
     float *g_ = nullptr, *u_ = nullptr, *h_ = nullptr, *d_ = nullptr, *rl_ = nullptr,

@@ -4173,6 +4173,16 @@ void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, in
             "a batch's projections");
 }
 
+void gemm_f16w(void* blas, const uint16_t* w, const uint16_t* x, float* y, int n_in, int n_out, int rows) {
+    const dpct::blas::descriptor_ptr h = (dpct::blas::descriptor_ptr)blas;
+    const float one = 1.0f, zero = 0.0f;
+    blas_ck(DPCT_CHECK_ERROR(oneapi::mkl::blas::column_major::gemm(
+                h->get_queue(), oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans, n_out, rows, n_in,
+                one, reinterpret_cast<const sycl::half*>(w), n_in, reinterpret_cast<const sycl::half*>(x), n_in,
+                zero, y, n_out)),
+            "a batch's fp16 projection");
+}
+
 void guard_half_sums(float* x, int64_t ld, int width, int rows, float* factor, void* stream) {
     if (rows > 0) {
         auto exp_props = sycl::ext::oneapi::experimental::properties{

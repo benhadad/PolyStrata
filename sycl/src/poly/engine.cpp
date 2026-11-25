@@ -20,6 +20,10 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "moe_xmx.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
+
+// STRATA_PROJ_XMX: the largest dense matrix (in values) taken as halves; 64 Mi values is 128 MiB of scratch
+static constexpr size_t kProjMaxValues = size_t(64) << 20;
 #include "strata/platform/memory.hpp"
 
 #include "ggml.h"
@@ -1809,6 +1813,10 @@ Dev Engine::upload_as(const TensorInfo* t, const std::string& name, int64_t n_in
     const uint32_t type = as_is ? t->type : want == kF32 ? kTypeF32 : kTypeBF16;
     const size_t out = as_is ? bytes : count * (type == kTypeF32 ? sizeof(float) : sizeof(uint16_t));
     if (type == kTypeBF16) bf16_max_ = std::max(bf16_max_, count);
+    if (as_is && (type == 8 || type == 12 || type == 13 || type == 14) && count <= kProjMaxValues && n_out >= 512) {
+        proj_w_max_ = std::max(proj_w_max_, count);
+        proj_x_max_ = std::max(proj_x_max_, (size_t) n_in);
+    }
     const Dev d{dense_ ? dense_ + dense_at_ : nullptr, type, (int) n_in, (int) n_out};
     dense_at_ += pad(out) + kTail;
     if (!dense_) return d;
@@ -3234,6 +3242,14 @@ void Engine::shared_scratch() {
     rl_ = fbuf(n * n_expert_);
     logits_ = fbuf((size_t) n_vocab_);
     if (rows_ >= kStageRows && bf16_max_ > 0) wf_ = fbuf(bf16_max_);   // a BF16 matrix as floats, for lin()
+    {
+        const char* pe = std::getenv("STRATA_PROJ_XMX");
+        proj_on_ = pe && std::atoi(pe) != 0 && rows_ >= kStageRows && proj_w_max_ > 0;
+        if (proj_on_) {   // a prompt batch's dense projections: the weight as halves, one oneMKL product
+            proj_w16_ = (uint16_t*) dmalloc(proj_w_max_ * sizeof(uint16_t), "scratch");
+            proj_x16_ = (uint16_t*) dmalloc((size_t) rows_ * proj_x_max_ * sizeof(uint16_t), "scratch");
+        }
+    }
     if (mmq_) {
         const size_t rr = n * n_used_;
         gu_ = fbuf(rr * 2 * n_ff_exp_);
@@ -3882,6 +3898,14 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
         }
         if (w.type == kTypeF32) return gemv_f32(fp(w), x, y, w.n_in, w.n_out, per, n, st_);
         return gemv_bf16((const uint16_t*) w.p, x, y, w.n_in, w.n_out, per, n, st_);
+    }
+    // STRATA_PROJ_XMX=1: a prompt batch's projection as one half product (the weight dequantized, the input as halves)
+    if (proj_on_ && n >= kStageRows && n <= rows_ && (w.type == 8 || w.type == 12 || w.type == 13 || w.type == 14) &&
+        (size_t) w.n_in * w.n_out <= proj_w_max_ && (size_t) w.n_in <= proj_x_max_ && w.n_out >= 512 && !opt_.dump) {
+        kernels::dequant_f16((int) w.type, w.p, 0, w.n_out, w.n_in, proj_w16_, st_);
+        xmx::f32_to_f16(x, proj_x16_, (size_t) n * w.n_in, st_);
+        gemm_f16w(blas_, proj_w16_, proj_x16_, y, w.n_in, w.n_out, n);
+        return;
     }
     // a prompt batch: llama.cpp's matrix-matrix kernels read the weights once for all the tokens
     if (mmq_ && n >= kStageRows && Mmq::fits((int) w.type, w.n_out, w.n_in, lowbit_experts_)) {
@@ -5582,8 +5606,11 @@ void Engine::run(const int32_t* tokens, int n) {
         t = Clock::now();
     };
     Clock::time_point tp = Clock::now();
+    sub_ms_.clear();
+    sub_t_ = std::chrono::steady_clock::now();
     for (int il = lo_; il < hi_; ++il) {
         Layer& L = layers_[(size_t) il];
+        sub_t_ = std::chrono::steady_clock::now();
         up(il, n, (size_t) n - 1);
         if (!routed(L)) { lap(t_nonrouted, tp); continue; }
         lap(t_up, tp);
@@ -5600,6 +5627,26 @@ void Engine::run(const int32_t* tokens, int n) {
     if (timed)
         std::fprintf(stderr, "stage-prof n=%d: head+shared %.1f ms, experts %.1f ms, tail %.1f ms, unrouted layers %.1f ms" "\n", n,
                      t_up, t_moe, t_tail, t_nonrouted);
+    if (timed && !sub_ms_.empty()) {
+        std::fprintf(stderr, "stage-prof head parts:");
+        for (const auto& e : sub_ms_) std::fprintf(stderr, " %s %.1f", e.first.c_str(), e.second);
+        std::fprintf(stderr, "%c", 10);
+    }
+}
+
+// STRATA_STAGE_PROF=2: inside a layer's head (Inkling::layer_head, attn) of a prompt batch, wait for the card and add the
+// time since the last lap to `name`.  Diagnostic: the waits cost a little.
+void Engine::sub_lap(const char* name, int n) {
+    static const char* pe = std::getenv("STRATA_STAGE_PROF");
+    static const bool on = pe && std::atoi(pe) >= 2;
+    if (!on || n < kStageRows) return;
+    ck(DPCT_CHECK_ERROR(cs(st_)->wait_and_throw()), "sub profile");
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - sub_t_).count();
+    sub_t_ = now;
+    for (auto& e : sub_ms_)
+        if (e.first == name) { e.second += ms; return; }
+    sub_ms_.emplace_back(name, ms);
 }
 
 // A row a sequence.  A layer's head is the sequence's own: its row of the buffers (shift_rows()) with the sequence
