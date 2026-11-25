@@ -2,8 +2,16 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace strata::poly::xmx {
+/// Whether one of the matrix-unit paths for a prompt batch is on (name: STRATA_MOE_XMX, STRATA_PROJ_XMX or
+/// STRATA_ATTN_XMX): on unless its variable, or STRATA_XMX for all three, is 0.  The variable of the path wins.
+inline bool enabled(const char* name) {
+    if (const char* v = std::getenv(name)) return std::atoi(v) != 0;
+    if (const char* v = std::getenv("STRATA_XMX")) return std::atoi(v) != 0;
+    return true;
+}
 /// out[i][0..n) = half(x[rows[i]][0..n)) for i < count; x has ld floats a row.
 void gather_f16(const float* x, int ld, const int32_t* rows, int count, int n, uint16_t* out, void* stream);
 /// out[i] = half(in[i]), i < count.

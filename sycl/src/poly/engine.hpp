@@ -602,7 +602,7 @@ protected:
     /// Whether moe_router()'s call of n tokens at layer L is routed on the card (moe_card()), so its host copies are not read.
     bool card_visit(const Layer& L, int n) const;
     /// A prompt batch's routed experts as grouped XMX products (moe_xmx()): every expert in VRAM, formats the grouped
-    /// kernel decodes.  Needs STRATA_MOE_XMX=1.
+    /// kernel decodes.  On unless STRATA_MOE_XMX=0 (or STRATA_XMX=0).
     bool xmx_layer(const Layer& M, int n) const;
     void sub_lap(const char* name, int n);   ///< STRATA_STAGE_PROF=2: wait, add the time since the last lap to `name`
     std::vector<std::pair<std::string, double>> sub_ms_;

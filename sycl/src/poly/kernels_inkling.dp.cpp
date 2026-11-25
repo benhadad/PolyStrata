@@ -10,6 +10,7 @@
 #include "strata/poly/inkling_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "attn_xmx.hpp"
+#include "moe_xmx.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -2639,9 +2640,9 @@ AttnArgs attn_args(const char* who, const float* q, const InklingRel& rel, const
 }
 }  // namespace
 
-// The prompt batch's attention on the matrix units (attn_xmx.hpp), opt-in: STRATA_ATTN_XMX=1.
+// The prompt batch's attention on the matrix units (attn_xmx.hpp): on unless STRATA_ATTN_XMX=0 (or STRATA_XMX=0).
 static bool xmx_attention() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_ATTN_XMX"); return e && std::atoi(e) != 0; }();
+    static const bool on = strata::poly::xmx::enabled("STRATA_ATTN_XMX");
     return on;
 }
 

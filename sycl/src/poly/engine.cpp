@@ -3243,8 +3243,7 @@ void Engine::shared_scratch() {
     logits_ = fbuf((size_t) n_vocab_);
     if (rows_ >= kStageRows && bf16_max_ > 0) wf_ = fbuf(bf16_max_);   // a BF16 matrix as floats, for lin()
     {
-        const char* pe = std::getenv("STRATA_PROJ_XMX");
-        proj_on_ = pe && std::atoi(pe) != 0 && rows_ >= kStageRows && proj_w_max_ > 0;
+        proj_on_ = xmx::enabled("STRATA_PROJ_XMX") && rows_ >= kStageRows && proj_w_max_ > 0;
         if (proj_on_) {   // a prompt batch's dense projections: the weight as halves, one oneMKL product
             proj_w16_ = (uint16_t*) dmalloc(proj_w_max_ * sizeof(uint16_t), "scratch");
             proj_x16_ = (uint16_t*) dmalloc((size_t) rows_ * proj_x_max_ * sizeof(uint16_t), "scratch");
@@ -3363,8 +3362,7 @@ void Engine::alloc() {
         d_ids_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
         d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
         d_slots_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
-        const char* xe = std::getenv("STRATA_MOE_XMX");
-        xmx_on_ = xe && std::atoi(xe) != 0 && rows_ >= kStageRows;
+        xmx_on_ = xmx::enabled("STRATA_MOE_XMX") && rows_ >= kStageRows;
         if (xmx_on_) {   // a prompt batch's picks, sorted by expert, through the grouped XMX products
             xmx_xh_ = (uint16_t*) dmalloc(rr * n_embd_ * sizeof(uint16_t), "scratch");
             xmx_yg_ = (float*) dmalloc(rr * 2 * n_ff_exp_ * sizeof(float), "scratch");
@@ -3899,7 +3897,7 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
         if (w.type == kTypeF32) return gemv_f32(fp(w), x, y, w.n_in, w.n_out, per, n, st_);
         return gemv_bf16((const uint16_t*) w.p, x, y, w.n_in, w.n_out, per, n, st_);
     }
-    // STRATA_PROJ_XMX=1: a prompt batch's projection as one half product (the weight dequantized, the input as halves)
+    // STRATA_PROJ_XMX (on unless 0): a prompt batch's projection as one half product (the weight dequantized, the input as halves)
     if (proj_on_ && n >= kStageRows && n <= rows_ && (w.type == 8 || w.type == 12 || w.type == 13 || w.type == 14) &&
         (size_t) w.n_in * w.n_out <= proj_w_max_ && (size_t) w.n_in <= proj_x_max_ && w.n_out >= 512 && !opt_.dump) {
         kernels::dequant_f16((int) w.type, w.p, 0, w.n_out, w.n_in, proj_w16_, st_);
