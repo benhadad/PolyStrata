@@ -2921,6 +2921,28 @@ __dpct_inline__ void nvfp4_sub16(uint8_t dbyte, uint32_t q0, uint32_t q1, sycl::
     store_run<sycl::half, 8>(y, lo);
     store_run<sycl::half, 8>(y + 8, hi);
 }
+// IQ4_NL loader for the grouped XMX GEMM (xmxg::launch, STRATA_XG_NV): ONE thread decodes a whole 32-value block of a
+// tile row (a K step) from the block read as 16-bit words, where dq_iq4_nl takes four threads a block.  Same
+// operations as dq_iq4_nl.  The blocks are 18 bytes (2-byte aligned).  Measured on the B70 (xmx_group_bench, down
+// 2304 x 1152, 64 rows an expert): 4.87 -> 3.92 ms a visit.  The same one-thread-a-group loaders for IQ3_XXS, IQ2_XS,
+// IQ2_S and IQ3_S were SLOWER than their generic decoders (+3, +5, +17, +25%) and are not in.
+__dpct_inline__ void dq32_iq4_nl(const block_iq4_nl* blk, sycl::half* y) {
+    const float d = (float) blk->d;
+    const uint16_t* w = (const uint16_t*) blk->qs;
+    float lo[16], hi[16];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t q = w[i];
+        lo[2 * i + 0] = d * kvalues_iq4nl[q & 0xf];
+        lo[2 * i + 1] = d * kvalues_iq4nl[(q >> 8) & 0xf];
+        hi[2 * i + 0] = d * kvalues_iq4nl[(q >> 4) & 0xf];
+        hi[2 * i + 1] = d * kvalues_iq4nl[(q >> 12) & 0xf];
+    }
+    store_run<sycl::half, 8>(y, lo);
+    store_run<sycl::half, 8>(y + 8, lo + 8);
+    store_run<sycl::half, 8>(y + 16, hi);
+    store_run<sycl::half, 8>(y + 24, hi + 8);
+}
 template <typename dst_t>
 inline void dq_nvfp4(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     const block_nvfp4* x = (const block_nvfp4*) vx + ibs * 4;
@@ -5948,7 +5970,20 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                         nv_store();
                     }
                 }
-                if (!(dbg & 1) && !(TY == 40 && nv >= 1))
+                // IQ4_NL, nv 1: a thread takes a whole 32-value block of a tile row (dq32_iq4_nl)
+                if constexpr (TY == 20) {
+                    if (nv >= 1 && !(dbg & 1)) {
+                        for (int v = lid; v < BN * (KS / 32); v += WG) {
+                            const int r = v / (KS / 32), c32 = v % (KS / 32), nr = n0 + r;
+                            const uint8_t* base = gu ? ((nr & 1) ? wb : wa) : wa;
+                            const int64_t row = gu ? (nr >> 1) : nr;
+                            const int64_t flat = row * K + k0 + 32 * c32;   // a multiple of 32
+                            dq32_iq4_nl((const block_iq4_nl*) base + (flat >> 5), pb + r * LDB + 32 * c32);
+                        }
+                    }
+                }
+                constexpr bool own_loader = TY == 40 || TY == 20;
+                if (!(dbg & 1) && !(own_loader && nv >= 1))
                 for (int v = lid; v < BN * (KS / 8); v += WG) {
                     const int r = v / (KS / 8), t8 = v % (KS / 8), c32 = t8 >> 2, sub = t8 & 3, nr = n0 + r;
                     const uint8_t* base = gu ? ((nr & 1) ? wb : wa) : wa;
@@ -6043,7 +6078,7 @@ void go(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, Grp& gp,
     const int nt = fill<C>(gp, cnt, n);
     if (spec && ty == 40) launch<C, k_xg<C, 40, true>, 40, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg, nv);
     else if (spec && ty == 18) launch<C, k_xg<C, 18, true>, 18, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
-    else if (spec && ty == 20) launch<C, k_xg<C, 20, true>, 20, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
+    else if (spec && ty == 20) launch<C, k_xg<C, 20, true>, 20, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg, nv);
     else launch<C, k_xg<C, -1, true>, -1, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
 }
 }  // namespace xmxg
@@ -6071,7 +6106,7 @@ void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, co
     static const int env_spec = [] { const char* e = std::getenv("STRATA_XG_SPEC"); return e ? std::atoi(e) : 1; }();
     static const int env_cfg = [] { const char* e = std::getenv("STRATA_XG_CFG"); return e ? std::atoi(e) : -1; }();
     static const int env_dbg = [] { const char* e = std::getenv("STRATA_XG_DBG"); return e ? std::atoi(e) : 0; }();
-    // STRATA_XG_NV=0: NVFP4 through the generic decoder (byte loads) instead of the loader of its own
+    // STRATA_XG_NV=0: NVFP4 and IQ4_NL through the generic decoders instead of the loaders of their own
     static const int env_nv = [] { const char* e = std::getenv("STRATA_XG_NV"); return e ? std::atoi(e) : 1; }();
 #ifdef STRATA_XMX_SG16
     const int cfg = env_cfg >= 0 ? env_cfg : 0;

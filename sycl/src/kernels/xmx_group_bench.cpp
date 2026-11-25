@@ -35,6 +35,7 @@ int main(int argc, char** argv) {
     for (auto& c : cnt) { c = std::max(1, (int) gd(rng)); tot += c; }
     struct Case { int ty; int64_t N, K; const char* what; };
     const Case cases[] = {{18, 2304, 2304, "gate/up IQ3_XXS"}, {40, 2304, 2304, "gate/up NVFP4"}, {17, 2304, 2304, "gate/up IQ2_XS"},
+                          {22, 2304, 2304, "gate/up IQ2_S"},   {21, 2304, 2304, "gate/up IQ3_S"},
                           {11, 2304, 2304, "gate/up Q3_K"},    {40, 2304, 1152, "down NVFP4"},    {20, 2304, 1152, "down IQ4_NL"}};
     const char* ks = std::getenv("STRATA_XG_KS");
     const char* sp = std::getenv("STRATA_XG_SPEC");
