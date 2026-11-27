@@ -33,6 +33,7 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/poly/inkling_postconv.hpp"
 #include "s26_tsum.dp.hpp"
 #include "slots.dp.hpp"        // SlotPtrs (the slots / ids launches)
 
@@ -2062,9 +2063,9 @@ struct Wide32IQ4NL {
         return r.d * (float) xb->ds[0] * (float) dp4a4(r.hi, ld_q8_16(xb, 1), dp4a4(r.lo, ld_q8_16(xb, 0), 0));
     }
 };
-template <typename F, int NCOLS>
+template <typename F, int NCOLS, class Store>
 void native_mmvq_wide32_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
-                               float* __restrict__ y, int n_in, int n_out) {
+                              int n_in, int n_out, Store store) {
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int lane = int(item.get_local_id(2)), warp = int(item.get_local_id(1));
     const int row = int(item.get_group(2)) * WARPS + warp;
@@ -2085,7 +2086,7 @@ void native_mmvq_wide32_kernel(const typename F::Block* __restrict__ w, const Q8
         float v = acc[j];
 #pragma unroll
         for (int o = WARP / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
-        if (lane == 0) y[std::size_t(j) * n_out + row] = v;
+        if (lane == 0) store(row, j, v);
     }
 }
 template <typename F, int NCOLS>
@@ -2095,7 +2096,11 @@ void launch_wide32(const void* weights, const void* x_q8_1, float* y, int n_in, 
     const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
     s->parallel_for<dpct_kernel_name<class native_mmvq_wide32, F, dpct_kernel_scalar<NCOLS>>>(
         sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
-        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_wide32_kernel<F, NCOLS>(w, x, y, n_in, n_out); });
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+            native_mmvq_wide32_kernel<F, NCOLS>(w, x, n_in, n_out, [=](int row, int col, float value) {
+                y[std::size_t(col) * n_out + row] = value;
+            });
+        });
 }
 inline bool wide_32() {   // STRATA_MMVQ_WIDE_32=0: Q8_0/IQ4_NL through the small/multi kernels (the old path)
     static const bool v = std::getenv("STRATA_MMVQ_WIDE_32") == nullptr || std::atoi(std::getenv("STRATA_MMVQ_WIDE_32")) != 0;
@@ -4311,6 +4316,35 @@ void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
     if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
     if (try_wide32<Wide32Q8>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+bool native_q8_0_postconv(const void* weights, const float* input, void* xq, int n_in, int n_out,
+                         const float* conv, float* history, float* residual, bool fresh, void* stream) {
+    if (n_in <= 0 || n_in % 32 != 0 || n_out <= 0 || !wide_32() || q8_packed_registry().contains(weights))
+        return false;
+
+    native_quantize_q8_1(input, xq, n_in, 1, stream);
+    auto* queue = strata::q_of(stream);
+    const auto* w = static_cast<const Q80Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(xq);
+    const auto blocks = (std::size_t(n_out) + WARPS - 1) / WARPS;
+    const auto group = sycl::range<3>(1, WARPS, WARP);
+    const float scale = 1.0f / std::sqrt(5.0f);
+    queue->parallel_for<dpct_kernel_name<class native_mmvq_wide32_postconv>>(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * group, group),
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+            native_mmvq_wide32_kernel<Wide32Q8, 1>(w, x, n_in, n_out, [=](int row, int, float value) {
+                float* h = history + std::size_t(row) * 3;
+                const float convolved = poly::conv_one(h[0], h[1], h[2], value,
+                                                       conv + std::size_t(row) * 4, nullptr, scale);
+                h[0] = h[1];
+                h[1] = h[2];
+                h[2] = value;
+                residual[row] = fresh ? convolved : residual[row] + convolved;
+            });
+        });
+    launch_check();
+    return true;
 }
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,

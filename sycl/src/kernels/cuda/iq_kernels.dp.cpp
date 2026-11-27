@@ -10,6 +10,7 @@
 #include "strata/sycl_math.hpp"
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/poly/xmx_situ.hpp"
 #include "strata/kernels/iq_dequant_expert.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
@@ -3146,16 +3147,20 @@ void dq_q6_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     }
 }
 template <typename dst_t>
+inline void dq_q8_0_run8(const block_q8_0& block, int run, dst_t* y) {
+    const float d = sycl::vec<sycl::half, 1>(block.d)
+                        .convert<float, sycl::rounding_mode::automatic>()[0];
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = (float)block.qs[8 * run + j] * d;
+    store_run<dst_t, 8>(y, v);
+}
+
+template <typename dst_t>
 inline void dq_q8_0(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     const block_q8_0* x = (const block_q8_0*) vx + ibs * (QK_K / QK8_0);
     const int ib = tid / 4, il = tid % 4;   // lanes 4b..4b+3 write block b: neighbouring lanes, neighbouring values
-    const float d = sycl::vec<sycl::half, 1>(x[ib].d)
-                        .convert<float, sycl::rounding_mode::automatic>()[0];
-    dst_t* y = yy + 32 * ib + 8 * il;
-    float v[8];
-#pragma unroll
-    for (int j = 0; j < 8; ++j) v[j] = (float)x[ib].qs[8 * il + j] * d;
-    store_run<dst_t, 8>(y, v);
+    dq_q8_0_run8(x[ib], il, yy + QK8_0 * ib + 8 * il);
 }
 
 // BF16 (the token embedding as the checkpoint ships it, tools/embd_bf16_pack.py): 8 values per thread.
@@ -5922,9 +5927,9 @@ struct Cfg {
 };
 // TY >= 0: the format is a template constant (one decoder in the kernel); -1: ty, read at run time.  dbg (diagnostic,
 // STRATA_XG_DBG): bit 0 skips the weights' decode, bit 1 the matrix products, bit 2 the activations' load.
-template <class C, class Name, int TY = -1, bool G256 = true>
+template <class C, class Name, int TY = -1, bool G256 = true, bool Fused = false>
 void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, const Grp& gp, int ntiles, int N, int K,
-            int dbg = 0, int nv = 0) {
+            int dbg = 0, int nv = 0, sycl::half* H = nullptr, XmxSitu situ = {}) {
     constexpr int BM = C::BM, BN = C::BN, KS = C::KS, WG = C::WG, SG = C::SG;
     constexpr int LDA = KS + 8, LDB = KS + 8;
     const int nb = N / BN;
@@ -5942,12 +5947,17 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
             const int m0 = (t - gp.tstart[e]) * BM;
             const int rows = sycl::min(BM, gp.off[e + 1] - gp.off[e] - m0);
             const sycl::half* Xe = X + ((size_t) gp.off[e] + m0) * K;
-            float* Ye = Y + ((size_t) gp.off[e] + m0) * N;
+            float* Ye = Fused ? nullptr : Y + ((size_t) gp.off[e] + m0) * N;
             const uint8_t* wa = gp.a[e];
             const uint8_t* wb = gp.b[e];
             const int n0 = (int) it.get_group(1) * BN;
             const int lid = (int) it.get_local_id(1), sgid = lid / SG;
             const int sgm = sgid / C::SGN, sgn = sgid % C::SGN;
+            // Each lane gets matching gate and up accumulator fragments in adjacent column tiles.
+            const auto weight_row = [=](int nr) -> int64_t {
+                if constexpr (Fused) return (nr / (2 * TN)) * TN + nr % TN + ((nr / TN) & 1) * (N / 2);
+                return gu ? nr >> 1 : nr;
+            };
             jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, TN> acc[C::MT][C::NT];
             for (int i = 0; i < C::MT; ++i)
                 for (int j = 0; j < C::NT; ++j) jm::joint_matrix_fill(sg, acc[i][j], 0.0f);
@@ -5966,7 +5976,7 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                         if (v < BN * T16) {
                             const int r = v / T16, t = v % T16, nr = n0 + r;
                             const uint8_t* base = gu ? ((nr & 1) ? wb : wa) : wa;
-                            const int64_t row = gu ? (nr >> 1) : nr;
+                            const int64_t row = weight_row(nr);
                             const int64_t kk = kk0 + 16 * t;
                             const block_nvfp4* blk = (const block_nvfp4*) base + (row * (K / 64) + (kk >> 6));
                             const int sb16 = (int) ((kk >> 4) & 3);
@@ -6012,7 +6022,7 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                         for (int v = lid; v < BN * (KS / 32); v += WG) {
                             const int r = v / (KS / 32), c32 = v % (KS / 32), nr = n0 + r;
                             const uint8_t* base = gu ? ((nr & 1) ? wb : wa) : wa;
-                            const int64_t row = gu ? (nr >> 1) : nr;
+                            const int64_t row = weight_row(nr);
                             const int64_t flat = row * K + k0 + 32 * c32;   // a multiple of 32
                             dq32_iq4_nl((const block_iq4_nl*) base + (flat >> 5), pb + r * LDB + 32 * c32);
                         }
@@ -6024,7 +6034,7 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                         for (int v = lid; v < BN * (KS / 32); v += WG) {
                             const int r = v / (KS / 32), c32 = v % (KS / 32), nr = n0 + r;
                             const uint8_t* base = gu ? ((nr & 1) ? wb : wa) : wa;
-                            const int64_t row = gu ? (nr >> 1) : nr;
+                            const int64_t row = weight_row(nr);
                             const int64_t flat = row * K + k0 + 32 * c32;   // a multiple of 32
                             dq32_q3_k((const block_q3_K*) base + (flat >> 8), (int) ((flat & 255) >> 5),
                                       pb + r * LDB + 32 * c32);
@@ -6036,8 +6046,13 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                 for (int v = lid; v < BN * (KS / 8); v += WG) {
                     const int r = v / (KS / 8), t8 = v % (KS / 8), c32 = t8 >> 2, sub = t8 & 3, nr = n0 + r;
                     const uint8_t* base = gu ? ((nr & 1) ? wb : wa) : wa;
-                    const int64_t row = gu ? (nr >> 1) : nr;
+                    const int64_t row = weight_row(nr);
                     const int64_t flat = row * K + k0 + 32 * c32;   // a multiple of 32
+                    if ((TY >= 0 ? TY : ty) == 8) {
+                        const auto* blocks = reinterpret_cast<const block_q8_0*>(base);
+                        dq_q8_0_run8(blocks[flat / QK8_0], sub, pb + r * LDB + 8 * t8);
+                        continue;
+                    }
                     const int64_t ibs = flat >> 8;
                     const int o32 = (int) (flat & 255), o = o32 + 8 * sub;
                     sycl::half* dst = pb + r * LDB + 32 * c32 - o32;
@@ -6074,7 +6089,31 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
                 }
                 it.barrier(sycl::access::fence_space::local_space);
             }
-            for (int i = 0; i < C::MT; ++i) {
+            if constexpr (Fused) {
+                static_assert(C::NT % 2 == 0);
+                const int ff = N / 2;
+                const int expert = situ.expert_ids ? situ.expert_ids[gp.off[e]] : 0;
+                const float gs = situ.gate_scales ? situ.gate_scales[expert] : 1.0f;
+                const float us = situ.up_scales ? situ.up_scales[expert] : 1.0f;
+                sycl::half* He = H + ((size_t) gp.off[e] + m0) * ff;
+                for (int i = 0; i < C::MT; ++i) {
+                    const int r = sgm * C::MT * 8 + i * 8;
+                    if (r >= rows) continue;
+                    for (int j = 0; j < C::NT; j += 2) {
+                        const int c = (n0 + (sgn * C::NT + j) * TN) / 2;
+                        auto gate = sycl::ext::oneapi::detail::get_wi_data(sg, acc[i][j]);
+                        auto up = sycl::ext::oneapi::detail::get_wi_data(sg, acc[i][j + 1]);
+#pragma unroll
+                        for (int elem = 0; elem < 8 * TN / SG; ++elem) {
+                            auto g = gate[elem];
+                            const auto [dr, dc] = g.get_coord();
+                            if (r + (int) dr < rows)
+                                He[(size_t) (r + dr) * ff + c + dc] =
+                                    sycl::half(poly::sycl_situ((float) g * gs, (float) up[elem] * us, situ.beta, situ.linear_beta));
+                        }
+                    }
+                }
+            } else for (int i = 0; i < C::MT; ++i) {
                 const int r = sgm * C::MT * 8 + i * 8;
                 if (r >= rows) continue;
                 for (int j = 0; j < C::NT; ++j) {
@@ -6126,17 +6165,29 @@ void go(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, Grp& gp,
         bool spec, int dbg, int nv) {
     const int nt = fill<C>(gp, cnt, n);
     if (spec && ty == 40) launch<C, k_xg<C, 40, true>, 40, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg, nv);
+    else if (spec && ty == 8) launch<C, k_xg<C, 8, true>, 8, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
     else if (spec && ty == 18) launch<C, k_xg<C, 18, true>, 18, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
     else if (spec && ty == 20) launch<C, k_xg<C, 20, true>, 20, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg, nv);
     else if (spec && ty == 11) launch<C, k_xg<C, 11, true>, 11, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg, nv);
     else launch<C, k_xg<C, -1, true>, -1, true>(q, ty, gu, X, Y, gp, nt, N, K, dbg);
 }
+#ifdef STRATA_XMX_SG16
+template <class C, int TY> class k_xg_situ;
+template <class C>
+void go_situ(sycl::queue& q, int ty, const sycl::half* X, sycl::half* H, Grp& gp, const int32_t* cnt, int n,
+             int N, int K, int dbg, int nv, const XmxSitu& situ) {
+    const int nt = fill<C>(gp, cnt, n);
+    if (ty == 40) launch<C, k_xg_situ<C, 40>, 40, true, true>(q, ty, false, X, nullptr, gp, nt, N, K, dbg, nv, H, situ);
+    else launch<C, k_xg_situ<C, 8>, 8, true, true>(q, ty, false, X, nullptr, gp, nt, N, K, dbg, 0, H, situ);
+}
+#endif
 }  // namespace xmxg
 
-void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, const int32_t* cnt, int n,
-                    const uint16_t* X, float* Y, int N, int K, void* stream) {
+static void launch_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, const int32_t* cnt, int n,
+                               const uint16_t* X, float* Y, int N, int K, void* stream, uint16_t* H, const XmxSitu* situ) {
     if (n <= 0) return;
-    if (n > kXmxGroupMax || N % 128 != 0 || K % 32 != 0 || !(is_iq(ty) || ty == 40) || (ty == 40 && K % 64 != 0)) {
+    if (n > kXmxGroupMax || N % 128 != 0 || K % 32 != 0 || !(is_iq(ty) || ty == 40) || (ty == 40 && K % 64 != 0) ||
+        (situ && ((ty != 8 && ty != 40) || ((situ->gate_scales || situ->up_scales) && !situ->expert_ids)))) {
         std::fprintf(stderr, "iq_xmx_grouped: bad arguments (type %d, n %d, N %d, K %d)\n", ty, n, N, K);
         std::exit(1);
     }
@@ -6163,9 +6214,29 @@ void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, co
 #else
     const int cfg = env_cfg >= 0 ? env_cfg : (tot / n < 96 ? 0 : 1);
 #endif
-    if (cfg == 0) xmxg::go<xmxg::Small>(q, ty, gu, Xh, Y, gp, cnt, n, N, K, env_spec != 0, env_dbg, env_nv);
+    if (situ) {
+#ifdef STRATA_XMX_SG16
+        auto* Hh = reinterpret_cast<sycl::half*>(H);
+        if (cfg == 0) xmxg::go_situ<xmxg::Small>(q, ty, Xh, Hh, gp, cnt, n, N, K, env_dbg, env_nv, *situ);
+        else xmxg::go_situ<xmxg::Big>(q, ty, Xh, Hh, gp, cnt, n, N, K, env_dbg, env_nv, *situ);
+#else
+        (void) H;
+        std::fprintf(stderr, "iq_xmx_grouped_situ: requires the sub-group 16 XMX build\n");
+        std::exit(1);
+#endif
+    } else if (cfg == 0) xmxg::go<xmxg::Small>(q, ty, gu, Xh, Y, gp, cnt, n, N, K, env_spec != 0, env_dbg, env_nv);
     else xmxg::go<xmxg::Big>(q, ty, gu, Xh, Y, gp, cnt, n, N, K, env_spec != 0, env_dbg, env_nv);
     check("iq_xmx_grouped");
+}
+
+void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, const int32_t* cnt, int n,
+                    const uint16_t* X, float* Y, int N, int K, void* stream) {
+    launch_xmx_grouped(ty, a, b, cnt, n, X, Y, N, K, stream, nullptr, nullptr);
+}
+
+void iq_xmx_grouped_situ(int ty, const uint8_t* const* weights, const int32_t* counts, int experts,
+                         const uint16_t* inputs, uint16_t* activations, int n_ff, int K, const XmxSitu& situ, void* stream) {
+    launch_xmx_grouped(ty, weights, nullptr, counts, experts, inputs, nullptr, 2 * n_ff, K, stream, activations, &situ);
 }
 
 

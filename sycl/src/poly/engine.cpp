@@ -20,6 +20,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "moe_xmx.hpp"
+#include "strata/poly/xmx_situ.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 
 // STRATA_PROJ_XMX: the largest dense matrix (in values) taken as halves; 64 Mi values is 128 MiB of scratch
@@ -4683,6 +4684,13 @@ bool Engine::card_moe(int n) {
 static bool xmx_type(int t, int k) {
     int qk;
     switch (t) {
+        case 8: {                                            // Q8_0
+            static const bool enabled = [] {
+                const char* e = std::getenv("STRATA_MOE_XMX_Q8_0");
+                return e && std::atoi(e) != 0;
+            }();
+            return enabled && k % 32 == 0;
+        }
         case 11: case 17: case 18: case 21: case 22: case 23: qk = 256; break;   // Q3_K, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S, IQ4_XS
         case 20: qk = 32; break;                               // IQ4_NL
         case 40: case 42: qk = 64; break;                      // NVFP4, Q2_0
@@ -4722,8 +4730,18 @@ bool Engine::moe_xmx(Layer& L, int il, int n) {
     }
     h2d_copy(xmx_idx_, idx.data(), idx.size() * sizeof(int32_t));
     sub_lap("x-route-sort", n);
+    const ExpertScales es = expert_scales(L, xmx_idx_ + rr);
+#ifdef STRATA_XMX_SG16
+    static const bool situ_fusion = [] {
+        const char* e = std::getenv("STRATA_MOE_XMX_FUSE_SITU");
+        return e && std::atoi(e) != 0;
+    }();
+    const bool fused = situ_fusion && situ_ && (L.gu_type == 8 || L.gu_type == 40);
+#else
+    const bool fused = false;
+#endif
     // the sorted rows of an expert-by-expert product, up to kXmxGroupMax experts a launch
-    const auto grouped = [&](int ty, size_t slot_off, const uint16_t* x, float* y, int n_out, int k) {
+    const auto grouped = [&](int ty, size_t slot_off, const uint16_t* x, float* y, int n_out, int k, bool activation) {
         int done = 0;
         for (int e = 0; e < ne;) {
             const uint8_t* a[kernels::kXmxGroupMax];
@@ -4736,19 +4754,26 @@ bool Engine::moe_xmx(Layer& L, int il, int n) {
                 rows += cnt[(size_t) e];
             }
             if (m == 0) break;
-            kernels::iq_xmx_grouped(ty, a, nullptr, c, m, x + (size_t) done * k, y + (size_t) done * n_out, n_out, k, st_);
+            const uint16_t* inputs = x + (size_t) done * k;
+            if (activation) {
+                const kernels::XmxSitu s{es.gate, es.up, es.ids ? es.ids + done : nullptr, situ_->beta, situ_->lin_beta};
+                kernels::iq_xmx_grouped_situ(ty, a, c, m, inputs, xmx_h16_ + (size_t) done * ff, ff, k, s, st_);
+            } else {
+                kernels::iq_xmx_grouped(ty, a, nullptr, c, m, inputs, y + (size_t) done * n_out, n_out, k, st_);
+            }
             done += rows;
         }
     };
     xmx::gather_f16(xn_, n_embd_, xmx_idx_, rr, n_embd_, xmx_xh_, st_);
     sub_lap("x-gather", n);
-    grouped((int) L.gu_type, 0, xmx_xh_, xmx_yg_, 2 * ff, n_embd_);
+    grouped((int) L.gu_type, 0, xmx_xh_, xmx_yg_, 2 * ff, n_embd_, fused);
     sub_lap("x-gateup", n);
-    const ExpertScales es = expert_scales(L, xmx_idx_ + rr);
-    act_rows(xmx_yg_, xmx_hf_, rr, clamp_exp_[(size_t) il], &es);
-    xmx::f32_to_f16(xmx_hf_, xmx_h16_, (size_t) rr * ff, st_);
-    sub_lap("x-act", n);
-    grouped((int) L.d_type, L.gu2(), xmx_h16_, xmx_yd_, n_embd_, ff);
+    if (!fused) {
+        act_rows(xmx_yg_, xmx_hf_, rr, clamp_exp_[(size_t) il], &es);
+        xmx::f32_to_f16(xmx_hf_, xmx_h16_, (size_t) rr * ff, st_);
+        sub_lap("x-act", n);
+    }
+    grouped((int) L.d_type, L.gu2(), xmx_h16_, xmx_yd_, n_embd_, ff, false);
     sub_lap("x-down", n);
     if (!L.h_s_down.empty()) expert_weights(d_wts_, fp(L.s_down), d_ids_, rr, st_);
     xmx::sum_perm(xmx_yd_, xmx_idx_ + 2 * rr, d_wts_, fo_, n_embd_, n_used_, n, st_);

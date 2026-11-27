@@ -5,9 +5,11 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "inkling.hpp"
+#include "norm_q8_1.hpp"
 
 #include "runtime.hpp"
 #include "strata/poly/inkling_kernels.hpp"
+#include "strata/poly/inkling_postconv.hpp"
 #include "strata/poly/kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -548,7 +550,6 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
     dump("kqv_out", v, att_, hq, n);
     mul_sigmoid(att_, gate_, hq, n, hq, false, st_);
     sub_lap("gate", n);
-    lin(B.wo, att_, o_, n);   // the post-convolution: layer_head(), with the residual
 }
 
 // A visit from its input to its router's copy.  The streams: see inkling.hpp.
@@ -622,6 +623,13 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     // the attention's inputs: the stream, or its mix with the blocks (one for a window layer, Q, K and V apart
     // for a full one)
     const float* in[3] = {cres, cres, cres};
+    static const bool fuse_mix_norm = [] {
+        const char* mix = std::getenv("STRATA_MIX_NORM");
+        const char* fuse = std::getenv("STRATA_FUSE_NORM");
+        return mix && std::atoi(mix) != 0 && (!fuse || std::atoi(fuse) != 0);
+    }();
+    const bool first_pass_mix_norm = fuse_mix_norm && n == 1 && B.pass == 0;
+    bool attn_norm_done = false;
     if (B.attn_query.p) {
         InklingMix m;
         for (int k = 0; k < nb; ++k) m.state[k] = bp[k];
@@ -630,7 +638,16 @@ void Inkling::layer_head(Layer& L, int v, int n) {
         m.query = fp(B.attn_query);
         m.n_query = B.swa ? 1 : 3;
         for (int j = 0; j < m.n_query; ++j) m.out[j] = mix_[j];
-        if (!abl(1, n)) inkling_mix(m, n_embd_, n, norm_eps_, st_);
+        if (!abl(1, n)) {
+            if (first_pass_mix_norm && !abl(4, n)) {
+                const Dev* w[3] = {&B.q_norm, &B.k_norm, &B.v_norm};
+                std::array<MixNormOutput, 3> outputs{};
+                for (int j = 0; j < m.n_query; ++j)
+                    outputs[j] = {fp(B.swa ? L.attn_norm : *w[j]), in_[j], inq_[j]};
+                attn_norm_done = inkling_mix_norm(m, outputs, n_embd_, norm_eps_, rms_eps_, st_);
+            }
+            if (!attn_norm_done) inkling_mix(m, n_embd_, n, norm_eps_, st_);
+        }
         for (int j = 0; j < 3; ++j) in[j] = mix_[B.swa ? 0 : j];
     }
     // a later pass's messages: the pass before's mix, gated into each input
@@ -665,7 +682,7 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     const int threads = sum_threads(n_embd_);
     const void* q8[3];
     const auto norm = [&](int j, const float* x, const Dev& w) {
-        if (!abl(4, n))
+        if (!attn_norm_done && !abl(4, n))
             kernels::native_add_rms_norm_q8_1(const_cast<float*>(x), nullptr, fp(w), in_[j], inq_[j], n_embd_, n,
                                               rms_eps_, threads, st_);
         q8[j] = inq_[j];
@@ -678,18 +695,45 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     } else {
         const Dev* w[3] = {&L.attn_norm, &L.attn_norm, &L.attn_norm};
         if (!B.swa) w[0] = &B.q_norm, w[1] = &B.k_norm, w[2] = &B.v_norm;
-        for (int j = 0; j < 3; ++j) {
-            norm(j, in[j], *w[j]);
-            x[j] = in_[j];
+        static const bool batch_norm = [] {
+            const char* batch = std::getenv("STRATA_QKV_BATCH_NORM");
+            const char* fuse = std::getenv("STRATA_FUSE_NORM");
+            return batch && std::atoi(batch) != 0 && (!fuse || std::atoi(fuse) != 0);
+        }();
+        if (!attn_norm_done && batch_norm && n == 1 && n_embd_ % 32 == 0 && !abl(4, n)) {
+            std::array<NormQ81Row, 3> jobs;
+            for (int j = 0; j < 3; ++j) {
+                jobs[j] = {in[j], fp(*w[j]), in_[j], inq_[j]};
+                x[j] = in_[j];
+                q8[j] = inq_[j];
+            }
+            rms_norm_q8_1_qkv(jobs, n_embd_, rms_eps_, st_);
+        } else {
+            for (int j = 0; j < 3; ++j) {
+                norm(j, in[j], *w[j]);
+                x[j] = in_[j];
+            }
         }
     }
     sub_lap("norm", n);
-    if (!abl(8, n)) attn(B, v, x[0], x[1], x[2], q8, n);
-    sub_lap("wo", n);
+    const bool run_attn = !abl(8, n);
+    if (run_attn) attn(B, v, x[0], x[1], x[2], q8, n);
+    static const bool fuse_postconv = [] {
+        const char* flag = std::getenv("STRATA_WO_POSTCONV");
+        return flag && std::atoi(flag) != 0;
+    }();
+    const bool run_postconv = !abl(16, n);
+    const bool try_fused = fuse_postconv && run_attn && run_postconv && n == 1 && !rows_of_ && !snap_bits_ &&
+                           B.wo.type == 8 && B.wo.scale == 1.0f && B.wo.n_out == n_embd_;
+    if (!try_fused) {
+        if (run_attn) lin(B.wo, att_, o_, n);
+        sub_lap("wo", n);
+    }
 
     // the first layer of a block starts the stream afresh, and what it started from is the block's
     float* const post = B.conv + (size_t) 2 * (n_conv_ - 1) * n_kv_ * head_dim_;   // the attention-out's state
-    if (ip % kBlockSize == 0) {
+    const bool fresh = ip % kBlockSize == 0;
+    if (fresh) {
         const int k = ip / kBlockSize;
         if (direct) {
             /*
@@ -715,10 +759,15 @@ void Inkling::layer_head(Layer& L, int v, int n) {
                "streams");
             bp[k] = blk_[k];
         }
-        if (!abl(16, n)) post_conv(o_, post, B.post_conv, cres, n, true, rows_of_);
-    } else {
-        if (!abl(16, n)) post_conv(o_, post, B.post_conv, cres, n, false, rows_of_);
     }
+    bool fused = false;
+    if (try_fused) {
+        fused = kernels::native_q8_0_postconv(B.wo.p, att_, q8_, B.wo.n_in, B.wo.n_out,
+                                            fp(B.post_conv), post, cres, fresh, st_);
+        if (!fused) lin(B.wo, att_, o_, n);
+        sub_lap("wo", n);
+    }
+    if (run_postconv && !fused) post_conv(o_, post, B.post_conv, cres, n, fresh, rows_of_);
     sub_lap("post-conv", n);
     dump("ffn_inp", v, cres, n_embd_, n);
 
@@ -731,7 +780,14 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     m.query = fp(B.ffn_query);
     m.n_query = 1;
     m.out[0] = mix_[0];
-    if (!abl(32, n)) inkling_mix(m, n_embd_, n, norm_eps_, st_);
+    bool ffn_norm_done = false;
+    if (!abl(32, n)) {
+        if (first_pass_mix_norm) {
+            const std::array<MixNormOutput, 3> outputs{{{fp(L.ffn_norm), xn_, xq_}}};
+            ffn_norm_done = inkling_mix_norm(m, outputs, n_embd_, norm_eps_, rms_eps_, st_);
+        }
+        if (!ffn_norm_done) inkling_mix(m, n_embd_, n, norm_eps_, st_);
+    }
     float* f = mix_[0];
     if (B.pass > 0 && !abl(32, n)) {
         if (n <= kFusedRows) {
@@ -743,7 +799,7 @@ void Inkling::layer_head(Layer& L, int v, int n) {
         }
         f = ctl_[0];
     }
-    if (!abl(32, n))
+    if (!ffn_norm_done && !abl(32, n))
         kernels::native_add_rms_norm_q8_1(f, nullptr, fp(L.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
     sub_lap("ffn-mix", n);
     dump("ffn_in", v, xn_, n_embd_, n);

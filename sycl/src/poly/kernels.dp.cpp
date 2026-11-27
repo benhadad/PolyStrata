@@ -7,8 +7,9 @@
 #define __cvta_generic_to_shared(p) ((size_t)(p))
 #include "strata/sycl_queue.hpp"
 #include "strata/poly/kernels.hpp"
+#include "norm_q8_1.hpp"
 #include "strata/kernels/dp4a.hpp"
-#include "strata/kernels/q8_1_finite.hpp"   // rms_norm_q8_1()
+#include "norm_q8_1_device.hpp"
 #include <dpct/blas_utils.hpp>
 
 #ifdef STRATA_POLY_GDN_MMA
@@ -436,47 +437,12 @@ auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
                                                      : xr[i] * scale;
 }
 
-// native_quantize_q8_1_kernel's warp_max (kernels/cuda/native_mmvq.dp.cpp), which that file keeps to itself.
-__dpct_inline__ float warp_max_q8(float x) {
-#pragma unroll
-    for (int o = WARP / 2; o > 0; o >>= 1) x = sycl::fmax(
-        x, dpct::experimental::permute_sub_group_by_xor(
-               0xffffffff, sycl::ext::oneapi::this_work_item::get_sub_group(), x, o));
-    return x;
-}
-
-// rms_norm_kernel and, on each value it writes, native_quantize_q8_1_kernel: one launch where the two are one launch
-// each and the second reads back what the first wrote.  Every step is theirs, in their order: the sum of squares is
-// rms_norm_kernel's, and a 32-value block of the Q8_1 vector is the 32 lanes of one sub-group (the block is a
-// multiple of 32 threads, and a thread's values are its index plus a multiple of the block), so the scale and sum
-// come out of the same butterflies.  Not yet compared with the two launches on the card (see rms_norm_q8_1()).
-// A Q8_1 block is 36 bytes: the half2 (scale, sum) and 32 int8 (kernels::Q81Block of native_mmvq.dp.cpp).
-__dpct_inline__ void rms_norm_q8_1_kernel(const float *__restrict__ x,
-                                          const float *__restrict__ w, float *y,
-                                          uint8_t *q8, int n, float eps) {
-    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
-        sycl::ext::oneapi::this_work_item::get_work_group<3>());
-    const float *xr = x + size_t(item_ct1.get_group(2)) * n;
-    float *yr = y + size_t(item_ct1.get_group(2)) * n;
-    uint8_t *qr = q8 + size_t(item_ct1.get_group(2)) * size_t(n / 32) * 36;
-    float ss = 0.0f;
-#pragma unroll
-    for (int i = item_ct1.get_local_id(2); i < n;
-         i += item_ct1.get_local_range(2)) ss += xr[i] * xr[i];
-    ss = block_sum(ss, part);
-    const float scale = 1.0f / sycl::sqrt(ss / float(n) + eps);
-    for (int i = item_ct1.get_local_id(2); i < n;
-         i += item_ct1.get_local_range(2)) {   // n is a multiple of 32: a whole sub-group is in or out
-        const float yv = w ? xr[i] * scale * w[i] : xr[i] * scale;
-        yr[i] = yv;
-        const float amax = warp_max_q8(sycl::fabs(yv));
-        const float sum = warp_sum(yv);
-        const float d = strata::kernels::q8_1_finite(amax / 127.0f);
-        uint8_t *blk = qr + size_t(i / 32) * 36;
-        ((int8_t *)(blk + 4))[i % 32] = strata::kernels::q8_1_quant(yv, d, amax);
-        if ((i & 31) == 0) *(sycl::half2 *)blk = strata::kernels::q8_1_ds(d, sum);
-    }
+// Weighted RMSNorm and Q8_1 quantization of one row per work-group.
+__dpct_inline__ void rms_norm_q8_1_kernel(const float* x, const float* w, float* y,
+                                         uint8_t* q8, int n, float eps) {
+    const auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const auto row = item.get_group(2);
+    norm_q8_1_detail::write_row(x + row * n, w, y + row * n, q8 + row * (n / 32) * 36, n, eps, item);
 }
 
 __dpct_inline__ void layer_norm_kernel(const float *__restrict__ x,
@@ -4299,6 +4265,20 @@ void rms_norm_q8_1(const float* x, const float* w, float* y, void* y_q8_1, int n
         sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, threads), sycl::range(1, 1, threads)),
         exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
             rms_norm_q8_1_kernel(x, w, y, q8, n, eps);
+        });
+}
+
+void rms_norm_q8_1_qkv(std::array<NormQ81Row, 3> rows, int n, float eps, void* stream) {
+    const int threads = sum_threads(n);
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+    cs(stream)->parallel_for<dpct_kernel_name<class rms_norm_q8_1_qkv_kernel>>(
+        sycl::nd_range<3>(sycl::range<3>(3, 1, threads), sycl::range<3>(1, 1, threads)),
+        exp_props, [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+            // Group 0 selects the Q/K/V job; group 2 is zero for each job's single row.
+            const NormQ81Row& row = rows[item.get_group(0)];
+            rms_norm_q8_1_kernel(row.input, row.weight, row.normalized,
+                                 static_cast<uint8_t*>(row.quantized), n, eps);
         });
 }
 

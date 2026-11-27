@@ -8,6 +8,11 @@
 #define __cvta_generic_to_shared(p) ((size_t)(p))
 #include "strata/sycl_queue.hpp"
 #include "strata/poly/inkling_kernels.hpp"
+#include "strata/poly/inkling_postconv.hpp"
+#include "strata/poly/kernels.hpp"
+#include "norm_q8_1.hpp"
+#include "norm_q8_1_device.hpp"
+#include "strata/poly/xmx_situ.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "attn_xmx.hpp"
 #include "moe_xmx.hpp"
@@ -84,10 +89,6 @@ __dpct_inline__ float warp_max(float x) {
                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                x, o));
     return x;
-}
-
-__dpct_inline__ float sigmoidf(float x) {
-    return 1.0f / (1.0f + sycl::native::exp(-x));
 }
 
 // upstream: cast(pos) -> scale_bias(1, 1) -> scale(1 / floor) -> clamp(1, inf) -> log -> scale_bias(alpha, 1)
@@ -1706,24 +1707,6 @@ void launch_dec(const AttnArgs &a, const Rows &rows, int ntok, bool kq, bool vq,
 
 // ---- convolution -----------------------------------------------------------------------------------------------
 
-// The convolution of one token of one channel from its inputs s0 (oldest) .. s2 and v (the token's), in
-// upstream's order: ssm_conv's sum, then the four input-dependent taps lag 0..3, then the residual and the scale.
-__dpct_inline__ float conv_one(float s0, float s1, float s2, float v,
-                               const float *wc, const float *tp, float scale) {
-    float y = 0.0f;
-    y += s0 * wc[0];
-    y += s1 * wc[1];
-    y += s2 * wc[2];
-    y += v * wc[3];
-    if (tp) {
-        y += v * tp[0];
-        y += s2 * tp[1];
-        y += s1 * tp[2];
-        y += s0 * tp[3];
-    }
-    return (v + y) * scale;
-}
-
 // The convolution's scale: 1/3 with taps, 1/sqrt(5) without.
 inline float conv_scale(const float* taps) { return 1.0f / sqrtf(float((taps ? 2 : 1) * 4 + 1)); }
 
@@ -1961,14 +1944,15 @@ auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<
 constexpr int MIX4_MAX = 768;   // threads: a float4 each, so n <= 3072
 // mix_kernel for n a multiple of 4 up to 4 * MIX4_MAX, NS states: a thread a float4 of every state, read once into
 // registers and kept for the output, so that a token's whole read is on its way at once.  The same sums otherwise.
-template <int NS>
+template <int NS, bool FuseNorm = false>
 /*
 DPCT1110:147: The total declared local variable size in device function
 mix4_kernel exceeds 128 bytes and may cause high register pressure. Consult with
 your hardware vendor to find the total register size available and adjust the
 code, or use smaller sub-group size to avoid high register pressure.
 */
-__dpct_inline__ void mix4_kernel(InklingMix m, int n, float eps) {
+__dpct_inline__ void mix4_kernel(InklingMix m, int n, float eps,
+                                  const std::array<MixNormOutput, 3>* outputs = nullptr, float norm_eps = 0.0f) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int SUMS = NS * 5;
     auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<
@@ -1985,6 +1969,8 @@ __dpct_inline__ void mix4_kernel(InklingMix m, int n, float eps) {
               warp = item_ct1.get_local_id(2) / WARP;
     const int i = item_ct1.get_local_id(2), n4 = n / 4;
     const bool own = i < n4;
+    // The fused launch uses the RMSNorm block size. Keep the mix's original warp count.
+    const int warps = FuseNorm ? (n4 + WARP - 1) / WARP : item_ct1.get_local_range(2) / WARP;
     sycl::float4 xs[NS];
     float acc[SUMS];
 #pragma unroll
@@ -2013,7 +1999,7 @@ __dpct_inline__ void mix4_kernel(InklingMix m, int n, float eps) {
 #pragma unroll
     for (int j = 0; j < SUMS; ++j) {
         const float v = warp_sum(acc[j]);
-        if (lane == 0) part[warp][j] = v;
+        if (lane == 0 && warp < warps) part[warp][j] = v;
     }
     /*
     DPCT1065:266: Consider replacing sycl::nd_item::barrier() with
@@ -2021,7 +2007,6 @@ __dpct_inline__ void mix4_kernel(InklingMix m, int n, float eps) {
     performance if there is no access to global memory.
     */
     item_ct1.barrier();
-    const int warps = item_ct1.get_local_range(2) / WARP;
     for (int j = item_ct1.get_local_id(2); j < SUMS;
          j += item_ct1.get_local_range(
              2)) { // a block of n <= 128 has fewer threads than sums
@@ -2060,19 +2045,54 @@ __dpct_inline__ void mix4_kernel(InklingMix m, int n, float eps) {
     performance if there is no access to global memory.
     */
     item_ct1.barrier();
-    if (!own) return;
+    float* raw = nullptr;
+    if constexpr (FuseNorm) {
+        raw = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[4 * MIX4_MAX]>(item_ct1.get_group());
+    } else if (!own) {
+        return;
+    }
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
         if (q >= nq) break;
-        sycl::float4 y = sycl::float4(0, 0, 0, 0);
+        if (own) {
+            sycl::float4 y = sycl::float4(0, 0, 0, 0);
 #pragma unroll
-        for (int k = 0; k < NS; ++k) {
-            const float w = wts[q][k];
-            y.x() += w * xs[k].x(), y.y() += w * xs[k].y(),
-                y.z() += w * xs[k].z(), y.w() += w * xs[k].w();
+            for (int k = 0; k < NS; ++k) {
+                const float w = wts[q][k];
+                y.x() += w * xs[k].x(), y.y() += w * xs[k].y(),
+                    y.z() += w * xs[k].z(), y.w() += w * xs[k].w();
+            }
+            if constexpr (FuseNorm) {
+                raw[4 * i] = y.x();
+                raw[4 * i + 1] = y.y();
+                raw[4 * i + 2] = y.z();
+                raw[4 * i + 3] = y.w();
+            } else {
+                reinterpret_cast<sycl::float4*>(m.out[q] + t * n)[i] = y;
+            }
         }
-        reinterpret_cast<sycl::float4 *>(m.out[q] + t * n)[i] = y;
+        if constexpr (FuseNorm) {
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+            const auto& out = (*outputs)[q];
+            norm_q8_1_detail::write_row(raw, out.weight, out.normalized,
+                                        static_cast<uint8_t*>(out.quantized), n, norm_eps, item_ct1);
+            if (q + 1 < nq) item_ct1.barrier(sycl::access::fence_space::local_space);
+        }
     }
+}
+
+template <int NS> class mix4_norm_kernel;
+
+template <int NS>
+void launch_mix4_norm(const InklingMix& m, std::array<MixNormOutput, 3> outputs, int n,
+                      float mix_eps, float norm_eps, dpct::queue_ptr st) {
+    const size_t threads = sum_threads(n);
+    const auto work_group = sycl::range<3>(1, 1, threads);
+    st->parallel_for<mix4_norm_kernel<NS>>(
+        sycl::nd_range<3>(work_group, work_group),
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+            mix4_kernel<NS, true>(m, n, mix_eps, &outputs, norm_eps);
+        });
 }
 
 void launch_mix4(const InklingMix &m, int n, int rows, float eps,
@@ -2250,12 +2270,6 @@ __dpct_inline__ void ctrl_mix_kernel(const float *cur,
     out[i] = (c - sycl::tanh(forget[i]) * c) + sycl::tanh(gain[i]) * msg[i];
 }
 
-__dpct_inline__ float situ_one(float g, float u, float beta, float lb) {
-    const float act = sycl::tanh(g * (1.0f / beta)) * beta * sigmoidf(g);
-    const float up = lb > 0.0f ? sycl::tanh(u * (1.0f / lb)) * lb : u;
-    return act * up;
-}
-
 __dpct_inline__ sycl::float2 row_scales(const ExpertScales &s, int row) {
     if (!s.gate && !s.up) return sycl::float2(1.0f, 1.0f);
     const int e = s.ids ? s.ids[row] : s.e[row];
@@ -2272,7 +2286,7 @@ __dpct_inline__ void situ_rows_kernel(const float *__restrict__ gate_up,
     const float *row = gate_up + size_t(item_ct1.get_group(1)) * 2 * n;
     const sycl::float2 sc = row_scales(s, item_ct1.get_group(1));
     out[size_t(item_ct1.get_group(1)) * n + i] =
-        situ_one(row[i] * sc.x(), row[n + i] * sc.y(), beta, lb);
+        sycl_situ(row[i] * sc.x(), row[n + i] * sc.y(), beta, lb);
 }
 
 // ---- fused decode steps ------------------------------------------------------------------------------------------
@@ -2965,14 +2979,36 @@ void inkling_conv_acc_seqs(const float* x, float* const* states, const float* w,
     conv_seqs<true>(x, states, w, acc, channels, rows, stream);
 }
 
+namespace {
+bool mix4_aligned(const InklingMix& m, int n) {
+    bool aligned = n % 4 == 0 && n / 4 <= MIX4_MAX && (uintptr_t(m.query) & 15) == 0;
+    for (int k = 0; k < m.n_state; ++k) aligned = aligned && (uintptr_t(m.state[k]) & 15) == 0;
+    for (int q = 0; q < m.n_query; ++q) aligned = aligned && (uintptr_t(m.out[q]) & 15) == 0;
+    return aligned;
+}
+}  // namespace
+
+bool inkling_mix_norm(const InklingMix& m, std::array<MixNormOutput, 3> outputs, int n,
+                      float mix_eps, float norm_eps, void* stream) {
+    if (n <= 0 || n % 32 != 0 || m.n_state < 1 || m.n_state > 5 || m.n_query < 1 || m.n_query > 3 ||
+        !mix4_aligned(m, n)) return false;
+    auto* st = cs(stream);
+    switch (m.n_state) {
+        case 1: launch_mix4_norm<1>(m, outputs, n, mix_eps, norm_eps, st); break;
+        case 2: launch_mix4_norm<2>(m, outputs, n, mix_eps, norm_eps, st); break;
+        case 3: launch_mix4_norm<3>(m, outputs, n, mix_eps, norm_eps, st); break;
+        case 4: launch_mix4_norm<4>(m, outputs, n, mix_eps, norm_eps, st); break;
+        case 5: launch_mix4_norm<5>(m, outputs, n, mix_eps, norm_eps, st); break;
+    }
+    check_launch("inkling_mix_norm");
+    return true;
+}
+
 void inkling_mix(const InklingMix& m, int n, int rows, float eps, void* stream) {
     if (rows <= 0) return;
     if (m.n_state < 1 || m.n_state > kInklingMaxStates || m.n_query < 1 || m.n_query > 4)
         throw std::invalid_argument("inkling_mix: 1 to 8 states and 1 to 4 queries");
-    bool aligned = n % 4 == 0 && n / 4 <= MIX4_MAX && (uintptr_t(m.query) & 15) == 0;
-    for (int k = 0; k < m.n_state; ++k) aligned = aligned && (uintptr_t(m.state[k]) & 15) == 0;
-    for (int q = 0; q < m.n_query; ++q) aligned = aligned && (uintptr_t(m.out[q]) & 15) == 0;
-    if (aligned)
+    if (mix4_aligned(m, n))
         launch_mix4(m, n, rows, eps, cs(stream));
     else
     /*
